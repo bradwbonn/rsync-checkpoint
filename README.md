@@ -3,6 +3,7 @@ A python scanning tool and Node.js visualization program to show how closely up-
 ## Files:
 * dirscan.py - script that runs on each local system, also contains procedures to setup first configuration file
 * dirsync.js - Webpage that reads from Cloudant DB to obtain current sync state between the two hosts
+
 ## To-Do:
 * Finish dirscan.py
 * Create page for visualization
