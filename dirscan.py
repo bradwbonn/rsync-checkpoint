@@ -1,28 +1,39 @@
 #!/usr/bin/env python
 
 # Prep
-# from sys import argv
 import json
-import requests
 import getopt
 import base64
 import sys
 import datetime
 import time
+from cloudant import cloudant
+from getpass import getpass
 
-main_db_name = "rsynccheckpoint"
-doc_threshold = 2000
-default_config_name = "dirscansync.json"
+config = dict(
+    # Name of database in Cloudant for everything except file entries
+    main_db_name = 'rsynccheckpoint',
+    # Number of docs per bulk request
+    doc_threshold = 2000,
+    # Use this filename for configuration settings. JSON-formatted
+    default_config_filename = 'dirscansync.json',
+    # Slot for user-specified config file to read
+    passed_config_file = '',
+    # Slot for base64 auth string
+    cloudant_auth_string = '',
+    # Help string printed if invalid options or '-h' used
+    help_text = "Usage: dirscan.py [-c <configfile>] [-u]",
+    # Verbose setting (Default is off)
+    be_verbose = False
+)
 
-# Help string printed if invalid options or '-h' used
-help = "Usage: dirscan.py [-c <configfile>] [-u]"
-
+# Main execution code
 def main(argv):
     # Check options for validity, print help if user fat-fingered anything
     try:
-        opts, args = getopt.getopt(argv,"hc:u")
+        opts, args = getopt.getopt(argv,"hc:uv")
     except getopt.GetoptError:
-        print help
+        print config['help_text']
         sys.exit(2)
     
     # Process passed options
@@ -31,21 +42,25 @@ def main(argv):
             print help
             sys.exit()
         elif opt in ("-c"):
-            if len(arg) < 1:
+            if len(arg) < 6:
                 print help
                 sys.exit()
-            configfile = arg
+            config['passed_config_file'] = arg
         elif opt in ("-u"):
             update = 1 #this doesn't do anything yet
+        elif opt in ("-v"):
+            config['be_verbose'] = True
     
     # If config file is specfied, read it in and execute scan
-    if (configfile):
-        print "Loading " + configfile
-        configuration_json = read_config(configfile)
+    if (len(config['passed_config_file']) > 0):
+        if (config['be_verbose']):
+            print "Loading " + config['passed_config_file']
+        configuration_json = read_config(config['passed_config_file'])
         completion = directory_scan(configuration_json)
         if (completion):
             scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
-            print "Scan successfully completed at " + scanfinishtime
+            if (config['be_verbose']):
+                print "Scan successfully completed at " + scanfinishtime
             sys.exit()
         else:
             print "Scan failure, see logs for details."
@@ -58,25 +73,40 @@ def main(argv):
             print "Exiting..."
             sys.exit()
 
-def create_initial_config():
+# Obtain the username and password of the Cloudant account to use when creating the configuration file
+# Return the opened Cloudant class object for interaction
+def get_cloudant_auth():
     auth_not_set = 1
     while (auth_not_set):
+        print "You will need to have a Cloudant account created at www.cloudant.com to use this script."
         cloudant_user = raw_input("Enter Cloudant account name (DNS name before .cloudant.com) > ")
-        cloudant_login = raw_input("Enter login username (usually the account name) > ")
-        cloudant_pass = raw_input("Enter password > ")
+        cloudant_login = raw_input("Enter login username (often the same as the account name) > ")
+        cloudant_pass = getpass.getpass()
         usrPass = userid + ":" + password
-        cloudant_auth = base64.b64encode(usrPass)
+        config['cloudant_auth_string'] = base64.b64encode(usrPass)
         test_URI = "https://" + cloudant_user + ".cloudant.com"
         # Test auth by opening a cookie session, if not good try again
         if (test_auth(test_URI, cloudant_login, cloudant_pass)):
             auth_not_set = 0
+            client = cloudant(cloudant_login,cloudant_pass, account=cloudant_user)
+            return client
+        else:
+            print "Login failed, please try again."
+
+# Assemble and write the JSON-formatted configuration file for the host we're running on
+def create_initial_config():
+    # Initialize Cloudant client instance and obtain user credentials
+    client = get_cloudant_auth()
+    # Create database object for interaction
+    maindb = cloudant.database.CloudantDatabase(client, config['main_db_name'])
     while (relationship_status not in ("y", "Y", "n", "N")):
         relationship_status = raw_input("Is this host part of an existing relationship in the database (y/n) > ")
     if (relationship_status in ("y","Y")):
-        relationship_json = list_relationships(cloudant_user,cloudant_auth) # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
+        relationship_json = list_relationships(client) # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
         # Get hosts by ID's, print names and let user choose which host we are on. Pass that hostID for the config file
-        source_host_json = get_doc_by_ID(cloudant_user, main_db_name, cloudant_auth, relationship_json['sourcehost']).json()
-        target_host_json = get_doc_by_ID(cloudant_user, main_db_name, cloudant_auth, relationship_json['targethost']).json()
+        source_host_json = client.
+            #get_doc_by_ID(cloudant_user, config['main_db_name'], config['cloudant_auth_string'], relationship_json['sourcehost']).json()
+        target_host_json = get_doc_by_ID(cloudant_user, config['main_db_name'], config['cloudant_auth_string'], relationship_json['targethost']).json()
         print "Source host: " + source_host_json['hostname']
         print "Target host: " + target_host_json['hostname']
         while (is_this_source not in ("Y","y","N","n")):
@@ -85,16 +115,16 @@ def create_initial_config():
             hostID = source_host_json['_id']
         else:
             hostID = target_host_json['_id']    
-        config_filename = default_config_name
-        write_config_file(config_filename, cloudant_auth, cloudant_user, relationship_ID, hostID, doc_threshold) #TO-DO: make new JSON config file
-        print config_filename +" written. This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
-        print "To initiate a scan using cron, use 'dirscan.py -c /path/to/" + config_filename + "' in order to have it scan based on these config settings."
+        #config_filename = config['default_config_name']
+        write_config_file(config['default_config_filename'], config['cloudant_auth_string'], cloudant_user, relationship_ID, hostID, config['doc_threshold']) #TO-DO: make new JSON config file
+        print config['default_config_name'] +" written. This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
+        print "To initiate a scan using cron, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "' in order to have it scan based on these config settings."
     else:
-        create_new_relationship(cloudant_auth)
+        create_new_relationship(config['cloudant_auth_string'])
     run_now = raw_input("Would you like to run the first scan now? (Y/N) ")
     if (run_now in ("Y","y")):
         # Populate config JSON based on new file?
-        config_json = read_config(config_filename)
+        config_json = read_config(config['default_config_filename'])
         directory_scan(config_json)
     print "Exiting"
     sys.exit()
@@ -210,29 +240,6 @@ def create_initial_config_old():
             print "Failed to insert document into database, exiting."
             sys.exit()
         
-# Insert a document into the database, passing the dictionary object, URI (including database), and base64 auth string, returns true if successful
-def insert_single_doc_guid(dictionary, URI, auth64creds):
-    response = requests.post(
-        URI,
-        data=json.dumps(dictionary),
-        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-    )
-    if (response.status_code in (202,201,200)):
-        return(True)
-    else:
-        print "Could not insert document: " + response.status_code + response.json()["error"]
-        return(False)
-
-# Upload a batch of source file documents using the bulk API, return HTTP status code
-def insert_source_batch(doc_array, baseURI, db, auth64creds):
-    fullURI = baseURI + "/" + db + "/" + "_bulk_docs"
-    fullheaders = {"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-    response = requests.post(
-        fullURI,
-        data={"docs": doc_array},
-        headers=fullheaders
-    )
-    return(response.status_code)
 
 # Load configuration file from passed path and return resulting JSON
 def read_config(config_file):
@@ -240,6 +247,7 @@ def read_config(config_file):
         data = open(config_file)
     except IOError as e:
         print "I/O error({0}): {1}".format(e.errno, e.strerror)
+        sys.exit(2)
     config_json = json.load(data)
     data.close()
     return(config_json)
@@ -260,17 +268,7 @@ def test_auth(baseURI, user, password):
         headers = {"Content-Type": requests.cookies['AuthSession']}
     )
     return(True)
-    
-# Returns the requests object for the associated document
-def get_doc_by_ID(account, database, auth, docID):
-    fullURI = "https://" + account + ".cloudant.com/" + database + "/" + docID
-    fullheader = {"Content-Type":"application/json","Authentication":"Basic "+auth}
-    response = requests.get(
-        URI,
-        headers = fullheader
-    )
-    return(response)
-    
+      
 # TO-DO: Get relevant information from main database:
 def init_scan():
     # Relationship document
@@ -311,10 +309,10 @@ def directory_scan(config_json):
 # TO-DO: Find a host by name
 def find_host(host_name):
 
-# TO-DO: Find a relationship
-def list_relationships(cloudant_user,cloudant_auth):
+# TO-DO: Find a relationship by listing all known relationships and letting the user choose the appropriate one
+def list_relationships(cloudant_client):
     
-# ---------
+# -------------------------------------------------------------------------------------------------------------------------
 # SCRATCH SPACE BELOW HERE
 # Insert a file document into the database using it's unique ID and adds the current timestamp
 # NOT LIKELY TO BE USED DUE TO BULK API USAGE
@@ -330,3 +328,41 @@ def list_relationships(cloudant_user,cloudant_auth):
 #    else:
 #        print "Bulk upload failure: " + response.status_code
 #        return(False)
+
+# Insert a document into the database, passing the dictionary object, URI (including database), and base64 auth string, returns true if successful
+# DEPRECATED, USING CLOUDANT LIB create_document()
+def insert_single_doc_guid(dictionary, URI, auth64creds):
+    response = requests.post(
+        URI,
+        data=json.dumps(dictionary),
+        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
+    )
+    if (response.status_code in (202,201,200)):
+        return(True)
+    else:
+        print "Could not insert document: " + response.status_code + response.json()["error"]
+        return(False)
+
+# Upload a batch of source file documents using the bulk API, return HTTP status code
+# DEPRECATED, USING CLOUDANT LIB bulk_docs()
+def insert_source_batch(doc_array, baseURI, db, auth64creds):
+    fullURI = baseURI + "/" + db + "/" + "_bulk_docs"
+    fullheaders = {"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
+    response = requests.post(
+        fullURI,
+        data={"docs": doc_array},
+        headers=fullheaders
+    )
+    return(response.status_code)
+
+# Returns the requests object for the associated document
+# DEPRECATED, USING CLOUDANT LIB fetch()
+def get_doc_by_ID(account, database, auth, docID):
+    fullURI = "https://" + account + ".cloudant.com/" + database + "/" + docID
+    fullheader = {"Content-Type":"application/json","Authentication":"Basic "+auth}
+    response = requests.get(
+        URI,
+        headers = fullheader
+    )
+    return(response)
+  
