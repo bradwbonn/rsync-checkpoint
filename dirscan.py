@@ -13,7 +13,7 @@ from getpass import getpass
 config = dict(
     # Name of database in Cloudant for everything except file entries
     main_db_name = 'rsynccheckpoint',
-    # Number of docs per bulk request
+    # Number of docs per bulk request (Defaults to 2000 during initial configuration)
     doc_threshold = 2000,
     # Use this filename for configuration settings. JSON-formatted
     default_config_filename = 'dirscansync.json',
@@ -26,7 +26,27 @@ config = dict(
     # Help string printed if invalid options or '-h' used
     help_text = "Usage: dirscan.py [-c <configfile>] [-u]",
     # Verbose setting (Default is off)
-    be_verbose = False
+    be_verbose = False,
+    # ID of the relationship for this sync (Cloudant doc _id)
+    relationship = '',
+    # ID of the current host (Cloudant doc _id)
+    host_id = '',
+    # Flags for current relationship's sync setup
+    rsync_flags = '',
+    # Ignored files and directories by rsync process for this relationship
+    rsync_excluded = [],
+    # ID of the source host (Cloudant doc _id)
+    rsync_source = '',
+    # ID of the destination host (Cloudant doc _id)
+    rsync_target = '',
+    # Full path of source directory
+    rsync_source_dir = '',
+    # Full path of target directory
+    rsync_target_dir = '',
+    source_ip = '',
+    target_ip = '',
+    # Flag for whether we're scanning a source or target
+    is_source = True
 )
 
 # Main execution code
@@ -55,17 +75,23 @@ def main(argv):
     
     # If config file is specfied, read it in and execute scan
     if (len(config['passed_config_file']) > 0):
+        # Load configuration settings from file
         if (config['be_verbose']):
             print "Loading " + config['passed_config_file']
-        configuration_json = read_config(config['passed_config_file'])
-        completion = directory_scan(configuration_json)
+        load_config(config['passed_config_file'])
+        
+        # TO DO: Initiate scan
+        completion = directory_scan()
+        
+        # If scan completed successfully, output when verbose
         if (completion):
             scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
             if (config['be_verbose']):
                 print "Scan successfully completed at " + scanfinishtime
             sys.exit()
         else:
-            print "Scan failure, see logs for details."
+            if (config['be_verbose']):
+                print "Scan failure, see logs for details."
             sys.exit()
     else:
         newfile = raw_input("No configuration file specified. Do you wish to create one (Y/N) ? ")
@@ -99,46 +125,107 @@ def get_cloudant_auth():
 def create_initial_config():
     # Initialize Cloudant client instance and obtain user credentials
     client = get_cloudant_auth()
+    
     # Create database object for interaction
     maindb = cloudant.database.CloudantDatabase(client, config['main_db_name'])
+    
     # Create database if it doesn't exist (NO OP if it does)
     maindb.create()
+    
+    # Begin process of collecting data
     while (relationship_status not in ("y", "Y", "n", "N")):
         relationship_status = raw_input("Is this host part of an existing relationship in the database (y/n) > ")
+        
+    # For cases where the relationship is already defined
     if (relationship_status in ("y","Y")):
-        relationshipdoc = list_relationships(client) # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
-        # Get hosts by ID's, print names and let user choose which host we are on. Pass that hostID for the config file
-        with Document(maindb, relationshipdoc['sourcehost']) as sourcedoc:
-            sourcedoc.fetch()
-        with Document(maindb, relationshipdoc['targethost']) as targetdoc:
-            targetdoc.fetch()
-        print "Source host: " + sourcedoc['hostname']
-        print "Target host: " + targetdoc['hostname']
-        while (is_this_source not in ("Y","y","N","n")):
-            is_this_source = raw_input("Are we on the source host right now? (Y/N) ")
-        if (is_this_source in ("Y","y")):
-            hostID = sourcedoc['_id']
-        else:
-            hostID = targetdoc['_id']
-        config_file_content = dict(
-            'auth' = config['cloudant_auth_string'],
-            'cloudant_user' = config['cloudant_user'],
-            'relationship' = relationshipdoc['_id'],
-            'host_id' = hostID,
-            'threshold' = config['doc_threshold']
-        )
-        write_config_file(config_file_content) #TO-DO: make new JSON config file
+        # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
+        relationshipdoc = list_relationships(client)
+        
+        # Create this host's entry for the relationship at hand.
+        create_host_entry(maindb, relationshipdoc)
     else:
-        create_new_relationship()
-    run_now = raw_input("Would you like to run the first scan now? (Y/N) ")
-    if (run_now in ("Y","y")):
-        # Populate config JSON based on new file?
-        config_json = read_config(config['default_config_filename'])
-        directory_scan(config_json)
-    print "Exiting"
-    sys.exit()
+        # Create a new relationship for use, then choose the relationship automatically and run host setup
+        relationshipdoc = create_new_relationship(maindb)
+        create_host_entry(maindb, relationshipdoc)
 
-# Write a JSON-formatted file with the configuration settings
+# Take a given database and relationship document object and create a new host entry, plus write config file to local system
+def create_host_entry(db, relationshipdoc):
+    relationshipdoc.fetch()
+    print "Editing relationship: " + relationshipdoc['name']
+
+    # Get hosts by ID's from relationship, open docs and print names if they exist
+    config_count = 0
+    if (relationshipdoc['sourcehost'] != "UNDEFINED"):
+        print "Source host: " + sourcedoc['hostname']
+        config_count = config_count + 1
+    else:
+        print "Source host: NOT CONFIGURED"
+        
+    if (relationshipdoc['targethost'] != "UNDEFINED"):
+        print "Target host: " + targetdoc['hostname']
+        config_count = config_count + 1
+    else:
+        print "Target host: NOT CONFIGURED"
+       
+    # If both are configured, exit for now. (Future expansion may allow editing relationships) 
+    if (config_count == 2):
+        print "Sorry, relationship is already configured. Cannot modify."
+        sys.exit()
+    
+    # Get the information from the user about this host
+    is_this_source = ''
+    while (is_this_source not in ("Y","y","N","n")):
+        is_this_source = raw_input("Are we on the source host right now? (Y/N): ")
+    new_hostname = raw_input("Enter it's friendly hostname: ")
+    this_host_IP4 = raw_input("Enter IPv4 address of this host: ")
+    this_host_IP6 = raw_input("Enter IPv6 address of this host (Optional): ")
+    this_host_directory = raw_input("Enter this host's sync root directory (full path required): ")
+    
+    # TO-DO: Validate path exists
+    # validate_path(this_host_directory)
+    
+    # Create the new host document in the database and get it's ID
+    with Document(db) as sourcedoc:
+        sourcedoc['type'] = 'host'
+        sourcedoc['hostname'] = new_hostname
+        sourcedoc['ip4'] = this_host_IP4
+        sourcedoc['ip6'] = this_host_IP6
+        sourcedoc.create()
+        new_host_ID = sourcedoc['_id']
+        
+    # Update the relationship document
+    if (is_this_source in ("Y","y")):
+        config['is_source'] = True
+        which_host = 'sourcehost'
+        which_dir = 'sourcedir'
+    else:
+        config['is_source'] = False
+        which_host = 'targethost'
+        which_dir = 'targetdir'
+    relationshipdoc.update_field(
+        action = doc.field_set,
+        field = which_host,
+        value = new_host_ID
+    )
+    relationshipdoc.update_field(
+        action = doc.field_set,
+        field = which_dir,
+        value = this_host_directory
+    )
+
+    # Populate config file's content for host
+    config_file_content = dict(
+        auth = config['cloudant_auth_string'],
+        cloudant_user = config['cloudant_user'],
+        relationship = relationshipdoc['_id'],
+        host_id = new_host_ID,
+        threshold = config['doc_threshold']
+    )
+
+    # Write host's config file to disk
+    write_config_file(config_file_content)
+
+# Write a JSON-formatted file with the passed configuration settings
 def write_config_file(config_dict):
     config_json = json.dump(config_dict)
     try:
@@ -261,10 +348,9 @@ def create_initial_config_old():
         if not (insert_single_doc_guid(relationship_document, main_DB_URI, cloudant_auth)):
             print "Failed to insert document into database, exiting."
             sys.exit()
-        
 
-# Load configuration file from passed path and return resulting JSON
-def read_config(config_file):
+# Load configuration from file and database into configuration dictionary
+def load_config(config_file):
     try:
         data = open(config_file)
     except IOError as e:
@@ -272,7 +358,36 @@ def read_config(config_file):
         sys.exit(2)
     config_json = json.load(data)
     data.close()
-    return(config_json)
+    config['cloudant_auth'] = config_json['auth']
+    config['cloudant_user'] = config_json['cloudant_user']
+    config['relationship'] = config_json['relationship']
+    config['host_id'] = config_json['host_id']
+    config['doc_threshold'] = config_json['threshold']
+    
+    # Connect to database
+    with cloudant(config['cloudant_user'], config['cloudant_auth']) as client:
+        with CloudantDatabase(client, config['main_db_name']) as db:
+    
+            # Read in configuration of relationship from database
+            with Document(db, config['relationship']) as relationshipdoc:
+                config['rsync_flags'] = relationshipdoc['rsyncflags']
+                config['rsync_excluded'] = relationshipdoc['excludedfiles']
+                config['rsync_source'] = relationshipdoc['sourcehost']
+                config['rsync_target'] = relationshipdoc['targethost']
+                config['rsync_source_dir'] = relationshipdoc['sourcedir']
+                config['rsync_target_dir'] = relationshipdoc['targetdir']
+            
+            # Get hosts' IP addresses
+            with Document(db, config['rsync_source']) as sourcedoc:
+                config['source_ip'] = sourcedoc['ip4']
+            with Document(db, config['rsync_target']) as targetdoc:
+                config['target_ip'] = targetdoc['ip4']
+            
+    # Set flag for whether we're scanning a source or target
+    if (config['host_id'] == config['rsync_source']):
+        config['is_source'] = True
+    else:
+        config['is_source'] = False
 
 # Create and delete a cookie session using the passed credentials to test login 
 def test_auth(baseURI, user, password):
@@ -290,16 +405,14 @@ def test_auth(baseURI, user, password):
         headers = {"Content-Type": requests.cookies['AuthSession']}
     )
     return(True)
-      
-# TO-DO: Get relevant information from main database:
-def init_scan():
-    # Relationship document
-    # Host documents
-    # Last successful scan document
-    # Current per-diem database (based on UTC)
 
 # TO-DO: scan function with parameters passed
-def directory_scan(config_json):
+def directory_scan():
+    print "Not Implemented yet"
+    # Initialize by getting:
+        # Last successful scan document
+        # Current per-diem database (based on UTC)
+    
     # Iterate through directory structure
     # For each file:
         # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
@@ -309,7 +422,7 @@ def directory_scan(config_json):
         # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
     # Write summary scan document to main database
  
-# TO-DO: For a destination scan:
+    # For a destination scan:
     # Iterate through directory structure
     # For each file:
         # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
@@ -330,10 +443,13 @@ def directory_scan(config_json):
     
 # TO-DO: Find a host by name
 def find_host(host_name):
+    print "Not implemented yet"
 
 # TO-DO: Find a relationship by listing all known relationships and letting the user choose the appropriate one
 def list_relationships(cloudant_client):
+    print "Not implemented yet"
     
+
 # -------------------------------------------------------------------------------------------------------------------------
 # SCRATCH SPACE BELOW HERE
 # Insert a file document into the database using it's unique ID and adds the current timestamp
@@ -351,40 +467,40 @@ def list_relationships(cloudant_client):
 #        print "Bulk upload failure: " + response.status_code
 #        return(False)
 
-# Insert a document into the database, passing the dictionary object, URI (including database), and base64 auth string, returns true if successful
-# DEPRECATED, USING CLOUDANT LIB create_document()
-def insert_single_doc_guid(dictionary, URI, auth64creds):
-    response = requests.post(
-        URI,
-        data=json.dumps(dictionary),
-        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-    )
-    if (response.status_code in (202,201,200)):
-        return(True)
-    else:
-        print "Could not insert document: " + response.status_code + response.json()["error"]
-        return(False)
-
-# Upload a batch of source file documents using the bulk API, return HTTP status code
-# DEPRECATED, USING CLOUDANT LIB bulk_docs()
-def insert_source_batch(doc_array, baseURI, db, auth64creds):
-    fullURI = baseURI + "/" + db + "/" + "_bulk_docs"
-    fullheaders = {"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-    response = requests.post(
-        fullURI,
-        data={"docs": doc_array},
-        headers=fullheaders
-    )
-    return(response.status_code)
-
-# Returns the requests object for the associated document
-# DEPRECATED, USING CLOUDANT LIB fetch()
-def get_doc_by_ID(account, database, auth, docID):
-    fullURI = "https://" + account + ".cloudant.com/" + database + "/" + docID
-    fullheader = {"Content-Type":"application/json","Authentication":"Basic "+auth}
-    response = requests.get(
-        URI,
-        headers = fullheader
-    )
-    return(response)
+## Insert a document into the database, passing the dictionary object, URI (including database), and base64 auth string, returns true if successful
+## DEPRECATED, USING CLOUDANT LIB create_document()
+#def insert_single_doc_guid(dictionary, URI, auth64creds):
+#    response = requests.post(
+#        URI,
+#        data=json.dumps(dictionary),
+#        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
+#    )
+#    if (response.status_code in (202,201,200)):
+#        return(True)
+#    else:
+#        print "Could not insert document: " + response.status_code + response.json()["error"]
+#        return(False)
+#
+## Upload a batch of source file documents using the bulk API, return HTTP status code
+## DEPRECATED, USING CLOUDANT LIB bulk_docs()
+#def insert_source_batch(doc_array, baseURI, db, auth64creds):
+#    fullURI = baseURI + "/" + db + "/" + "_bulk_docs"
+#    fullheaders = {"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
+#    response = requests.post(
+#        fullURI,
+#        data={"docs": doc_array},
+#        headers=fullheaders
+#    )
+#    return(response.status_code)
+#
+## Returns the requests object for the associated document
+## DEPRECATED, USING CLOUDANT LIB fetch()
+#def get_doc_by_ID(account, database, auth, docID):
+#    fullURI = "https://" + account + ".cloudant.com/" + database + "/" + docID
+#    fullheader = {"Content-Type":"application/json","Authentication":"Basic "+auth}
+#    response = requests.get(
+#        URI,
+#        headers = fullheader
+#    )
+#    return(response)
   

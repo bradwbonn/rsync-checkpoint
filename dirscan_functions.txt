@@ -33,7 +33,7 @@ Types of queries to check file sync status:
 8. Search for existing relationship
     -> Use host ID's,dirIDs in M/R view to find. Can decrease group level for 
        only "relationship" docs
-        emit key=[<sourcehost>,<targethost>,<sourcedir>,<targetdir>] value=_id
+        emit key=[<sourcehost>,<targethost>,<sourcedir>,<targetdir>] value=null
     
  File document (per-diem database based on scan start time)
  ID: <40-char-sha1-hash-of:host,filename,path><ScanDateAsUTCtimestamp>
@@ -73,7 +73,7 @@ Types of queries to check file sync status:
   "type": "scan"
   "started: <UTC timestamp when scan began>
   "ended": <UTC timestamp when scan completed>
-  "succcess": <true/false> (false means usually error reading files in dir structure or scan aborted)
+  "success": <true/false> (false means usually error reading files in dir structure or scan aborted)
   "errorcount": <number of errors encountered during scan>
   "hostID": <ID of matching host doc>
   "directory": <path the script is set to scan>
@@ -102,7 +102,7 @@ Types of queries to check file sync status:
   "targethost": <target HostID>
   "sourcedir": <source directory or module>
   "targetdir": <target directory or module>
-  "active": <true/false>
+  "active": <true/false> # Not currently used
   "rsyncflags": ["flag1","flag2",...]
   "excludedfiles": ["string1","string2","string3"]
 
@@ -113,5 +113,6 @@ Configuration file JSON:
 	‘relationship’ = <ID of host relationship>,
 	‘host_id’ = <ID of host this file is for>,
 	‘threshold’ = <number of docs per bulk post>
+	‘maindbname’ = <name of central sync database> # Currently not used
 }
   
