@@ -19,6 +19,8 @@ config = dict(
     default_config_filename = 'dirscansync.json',
     # Slot for user-specified config file to read
     passed_config_file = '',
+    # Cloudant account name
+    cloudant_user = '',
     # Slot for base64 auth string
     cloudant_auth_string = '',
     # Help string printed if invalid options or '-h' used
@@ -99,28 +101,35 @@ def create_initial_config():
     client = get_cloudant_auth()
     # Create database object for interaction
     maindb = cloudant.database.CloudantDatabase(client, config['main_db_name'])
+    # Create database if it doesn't exist (NO OP if it does)
+    maindb.create()
     while (relationship_status not in ("y", "Y", "n", "N")):
         relationship_status = raw_input("Is this host part of an existing relationship in the database (y/n) > ")
     if (relationship_status in ("y","Y")):
-        relationship_json = list_relationships(client) # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
+        relationshipdoc = list_relationships(client) # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
         # Get hosts by ID's, print names and let user choose which host we are on. Pass that hostID for the config file
-        source_host_json = client.
-            #get_doc_by_ID(cloudant_user, config['main_db_name'], config['cloudant_auth_string'], relationship_json['sourcehost']).json()
-        target_host_json = get_doc_by_ID(cloudant_user, config['main_db_name'], config['cloudant_auth_string'], relationship_json['targethost']).json()
-        print "Source host: " + source_host_json['hostname']
-        print "Target host: " + target_host_json['hostname']
+        with Document(maindb, relationshipdoc['sourcehost']) as sourcedoc:
+            sourcedoc.fetch()
+        with Document(maindb, relationshipdoc['targethost']) as targetdoc:
+            targetdoc.fetch()
+        print "Source host: " + sourcedoc['hostname']
+        print "Target host: " + targetdoc['hostname']
         while (is_this_source not in ("Y","y","N","n")):
             is_this_source = raw_input("Are we on the source host right now? (Y/N) ")
         if (is_this_source in ("Y","y")):
-            hostID = source_host_json['_id']
+            hostID = sourcedoc['_id']
         else:
-            hostID = target_host_json['_id']    
-        #config_filename = config['default_config_name']
-        write_config_file(config['default_config_filename'], config['cloudant_auth_string'], cloudant_user, relationship_ID, hostID, config['doc_threshold']) #TO-DO: make new JSON config file
-        print config['default_config_name'] +" written. This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
-        print "To initiate a scan using cron, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "' in order to have it scan based on these config settings."
+            hostID = targetdoc['_id']
+        config_file_content = dict(
+            'auth' = config['cloudant_auth_string'],
+            'cloudant_user' = config['cloudant_user'],
+            'relationship' = relationshipdoc['_id'],
+            'host_id' = hostID,
+            'threshold' = config['doc_threshold']
+        )
+        write_config_file(config_file_content) #TO-DO: make new JSON config file
     else:
-        create_new_relationship(config['cloudant_auth_string'])
+        create_new_relationship()
     run_now = raw_input("Would you like to run the first scan now? (Y/N) ")
     if (run_now in ("Y","y")):
         # Populate config JSON based on new file?
@@ -129,6 +138,19 @@ def create_initial_config():
     print "Exiting"
     sys.exit()
 
+# Write a JSON-formatted file with the configuration settings
+def write_config_file(config_dict):
+    config_json = json.dump(config_dict)
+    try:
+        data = open(config['default_config_filename'])
+    except IOError as e:
+        print "I/O error({0}): {1}".format(e.errno, e.strerror)
+        sys.exit(2)
+    data.write(config_json)
+    data.close()
+    print config['default_config_name'] +" written. This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
+    print "To initiate a scan using cron, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "' in order to have it scan based on these config settings."
+    
 # If first run, prompt user for information about scan: BROKEN- NEEDS TO INSERT HOST DOCUMENTS FIRST IN ORDER TO GET THEIR ID'S THEN CREATE RELATIONSHIP
 def create_initial_config_old():
     # This host

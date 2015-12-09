@@ -105,4 +105,13 @@ Types of queries to check file sync status:
   "active": <true/false>
   "rsyncflags": ["flag1","flag2",...]
   "excludedfiles": ["string1","string2","string3"]
+
+Configuration file JSON:
+{
+	‘auth’ = <Cloudant Auth String>,
+	‘cloudant_user’ = <Cloudant account name>,
+	‘relationship’ = <ID of host relationship>,
+	‘host_id’ = <ID of host this file is for>,
+	‘threshold’ = <number of docs per bulk post>
+}
   
