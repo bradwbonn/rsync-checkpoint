@@ -44,6 +44,7 @@ config = dict(
     rsync_source_dir = '',
     # Full path of target directory
     rsync_target_dir = '',
+    # IP addresses of hosts in the relationship
     source_ip = '',
     target_ip = '',
     # Flag for whether we're scanning a source or target
@@ -129,15 +130,18 @@ def create_initial_config():
             print "Sorry, try again."
 
     # Create database object for interaction
-    maindb = client(config['main_db_name'])
-    if maindb.exists():
+    try:
+        maindb = client[config['main_db_name']]
         if config['be_verbose'] == True:
             print "Database found"
-    else:
-        # Create database if it doesn't exist (NO OP if it does)
+    except Exception:
+        # Create database if it doesn't exist
         maindb = client.create_database(config['main_db_name'])
+        if config['be_verbose'] == True:
+            print "Database created"
     
     # Begin process of collecting data
+    relationship_status = ''
     while (relationship_status not in ("y", "Y", "n", "N")):
         relationship_status = raw_input("Is this host part of an existing relationship in the database (y/n) > ")
         
@@ -451,14 +455,17 @@ def directory_scan():
 # TO-DO: Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
     print "Not implemented yet"
+    sys.exit()
     
 # TO-DO: Find a host by name
 def find_host(host_name):
     print "Not implemented yet"
+    sys.exit()
 
 # TO-DO: Find a relationship by listing all known relationships and letting the user choose the appropriate one
 def list_relationships(cloudant_client):
     print "Not implemented yet"
+    sys.exit()
     
 if __name__ == "__main__":
     main(sys.argv[1:])
