@@ -7,8 +7,15 @@ A python scanning tool and Node.js visualization program to show how closely up-
 
 ## To-Do:
 * Finish dirscan.py - host init nearly complete, then moving on to scan process
-* Create visualization system
+* Create visualization system 
+
+## How to set up:
+* Port 443 must be open for HTTPS traffic from scanning hosts
+* Execute `dirscan.py -v` on each host in the rsync relationship
+* Follow prompts to set up the configuration file for the host and to define the relationship between them
+* Create a cron task (or manually execute) the scan using `dirscan.py -c dirscansync.json`
 
 ## Known Issues:
 * Admin account required to create database and populate views. API keys not yet implemented.
 * Currently only supports one relationship per host pair. (only one directory sync per host pair)
+* An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated Cloudant docs from 'rsynccheckpoint' and per-diem database(s)
