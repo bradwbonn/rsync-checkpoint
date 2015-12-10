@@ -9,16 +9,18 @@ Types of queries to check file sync status:
     -> Shows latest scan document by hostID
     -> show time difference between scan completion times
     -> Updates when scans complete
-3. Determine a completion percentage based on scan total size and count of non-stale, non-orphaned files
+3. Determine a sync completion percentage based on scan total size and count of non-stale, non-orphaned files against source files
     -> M/R view:
-        -> only "file" docs with goodscan=true and source=false
+        -> only "file" docs with goodscan=true
         -> "For each doc:
-            -> emit key=[<scanID>,<orphaned>,<stale>] value=<size>
+            -> emit key=[<source>,<scanID>,<orphaned>,<stale>] value=<size>
             -> reduce _stats()
 4. Determine if a scan is running by checking view for most recent scanID in files?  Check against latest completed scanID?
         
 5. Search for scanned files by name
     -> search index on filename
+5. Search for hosts by name
+    -> search index on hostname
     
 6. Report on file types for a particular scan (most current by default)
     -> M/R view
@@ -40,7 +42,7 @@ Types of queries to check file sync status:
  Fields:
   "filename": <case_sensitive_name_of_file>
   "extension": <case-insensitive-file-extension>
-  "path": [relative,path,to,file,on,local,system,under,directory]
+  "path": [relative,path,to,file,on,local,system,under,sync,directory]
   "host": <ID of matching host doc>
   "size": <size in bytes of file>
   "permissionsUNIX": <UNIX-style_permission_flag_code>  (i.e. 755)
@@ -72,7 +74,8 @@ Types of queries to check file sync status:
  Fields:
   "type": "scan"
   "started: <UTC timestamp when scan began>
-  "ended": <UTC timestamp when scan completed>
+  "ended": <UTC timestamp when scan completed> (empty if still running)
+  "database": <per-diem database used for scan results>
   "success": <true/false> (false means usually error reading files in dir structure or scan aborted)
   "errorcount": <number of errors encountered during scan>
   "hostID": <ID of matching host doc>
