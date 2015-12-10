@@ -2,14 +2,15 @@
 
 # Prep
 import json
-import getopt
-import base64
-import sys
+from getopt import getopt
+from getopt import GetoptError
+from base64 import b64encode
 import datetime
 import time
 from cloudant.account import Cloudant
-import getpass
-#import requests
+from getpass import getpass
+from os import walk
+from os import path
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -25,7 +26,7 @@ config = dict(
     # Slot for base64 auth string
     cloudant_auth_string = '',
     # Help string printed if invalid options or '-h' used
-    help_text = "Usage: dirscan.py [-c <configfile>] [-u]",
+    help_text = "Usage: dirscan.py [-c <configfile>] [-u] [-x <excludes_file>] [-v]",
     # Verbose setting (Default is off)
     be_verbose = False,
     # ID of the relationship for this sync (Cloudant doc _id)
@@ -40,9 +41,9 @@ config = dict(
     rsync_source = '',
     # ID of the destination host (Cloudant doc _id)
     rsync_target = '',
-    # Full path of source directory
+    # Full path of source's root sync directory
     rsync_source_dir = '',
-    # Full path of target directory
+    # Full path of target's root sync directory
     rsync_target_dir = '',
     # IP addresses of hosts in the relationship
     source_ip = '',
@@ -51,11 +52,39 @@ config = dict(
     is_source = True
 )
 
+# Views in main database
+# Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
+maindb_views = dict(
+    all_relations = ['relationships',
+                     'allrelations',
+                     'function (doc) {if (doc.type === "relationship") { emit(doc.name, 1);}}',
+                     None],
+    all_hosts = ['hosts',
+                 'allhosts',
+                 'function (doc) {if (doc.type === "host") { emit([doc.name, doc.ip4], 1);}}',
+                 None],
+    recent_scans = ['scans',
+                    'recentscans',
+                    'function (doc) {if (doc.type === "scan" && doc.ended > 0) {emit([doc.host, doc.success, doc.started], doc.database);}}',
+                    None]
+)
+
+# Views in each per-diem file dbs
+# Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
+filedb_views = dict(
+    file_types = [
+        'files',
+        'typesscanned',
+        'function (doc) { if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, doc.extension], doc.size); } }',
+        '_stats'
+    ]
+)
+
 # Main execution code
 def main(argv):
     # Check options for validity, print help if user fat-fingered anything
     try:
-        opts, args = getopt.getopt(argv,"hc:uv")
+        opts, args = getopt.getopt(argv,"hc:x:uv")
     except getopt.GetoptError:
         print config['help_text']
         sys.exit(2)
@@ -67,13 +96,16 @@ def main(argv):
             sys.exit()
         elif opt in ("-c"):
             if len(arg) < 6:
-                print help
-                sys.exit()
+                sys.exit(config['help_text'])
             config['passed_config_file'] = arg
         elif opt in ("-u"):
-            update = 1 #this doesn't do anything yet
+            update = 1 # This doesn't do anything yet
         elif opt in ("-v"):
             config['be_verbose'] = True
+        elif opt in ("-x"):
+            if len(arg) < 1:
+                sys.exit(config['help_text'])
+            get_excludes(arg)
     
     # If config file is specfied, read it in and execute scan
     if (len(config['passed_config_file']) > 0):
@@ -98,7 +130,7 @@ def main(argv):
                 print "Scan failure, see logs for details."
         sys.exit()
     else:
-        newfile = raw_input("No configuration file specified. Do you wish to create one (Y/N) ? ")
+        newfile = raw_input("No configuration file specified. Create? (Y/N) > ")
         if (newfile in ('y','Y')):
             create_initial_config()
         else:
@@ -129,39 +161,64 @@ def create_initial_config():
         except Exception:
             print "Sorry, try again."
 
-    # Create database object for interaction
+    # Create database object
     try:
+        # Open existing database
         maindb = client[config['main_db_name']]
         if config['be_verbose'] == True:
             print "Database found"
+        # To-do: validate views
+        
     except Exception:
+        
         # Create database if it doesn't exist
         maindb = client.create_database(config['main_db_name'])
         if config['be_verbose'] == True:
             print "Database created"
+        
+        # Insert design documents for required indexes in main db
+        for view in maindb_views:
+            with DesignDocument(db, document_id=view[0]) as ddoc:
+                ddoc.add_view(view[1], view[2], reduce_func=view[3])
     
     # Begin process of collecting data
     relationship_status = ''
     while (relationship_status not in ("y", "Y", "n", "N")):
-        relationship_status = raw_input("Is this host part of an existing relationship in the database (y/n) > ")
+        relationship_status = raw_input("Is the relationship for this host already set up? (y/n) > ")
         
-    # For cases where the relationship is already defined
     if (relationship_status in ("y","Y")):
-        # List relationships in database in pages, giving a line number for each for them to choose
-        # Get back a usable relationship document in Cloudant
-        relationshipdoc = list_relationships(client)
+        # For cases where the relationship is already defined
+        # Have the user get the existing relationship to complete
+        relationshipdocID = list_relationships(maindb)
         
-        # Create this host's entry for the relationship at hand.
-        create_host_entry(maindb, relationshipdoc)
+        # Setup this host in the relationship at hand.
+        create_host_entry(maindb, relationshipdocID)
+        
+        # Check to see if hosts and dirs are defined in relationship
+        with Document(maindb, relationshipdocID) as reldoc:
+            # If all are defined
+            if (len(reldoc['sourcehost']) > 0 and len(reldoc['sourcedir']) > 0 and len(reldoc['targethost']) > 0 and len(reldoc['targetdir']) > 0):
+                # Set relationship to active
+                reldoc['active'] = True
+                print "Both hosts are now set up for this relationship!"
+                print "To initiate a scan, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "'"
+                    
     else:
-        # Create a new relationship for use, then choose the relationship automatically and run host setup
-        relationshipdoc = create_new_relationship(maindb)
-        create_host_entry(maindb, relationshipdoc)
+        # Have the user set up a new relationship then 
+        relationshipdocID = create_new_relationship(maindb)
+        
+        # Choose the relationship automatically and run host setup
+        create_host_entry(maindb, relationshipdocID)
+        
+        print "Now run this setup on the other host."
     client.disconnect()
 
 # Take a given database and relationship document object and create a new host entry, plus write config file to local system
-def create_host_entry(db, relationshipdoc):
+def create_host_entry(db, relationshipdocID):
+    # Get the relationship document from Cloudant DB
+    relationshipdoc = Document(db, relationshipdocID)
     relationshipdoc.fetch()
+    
     print "Editing relationship: " + relationshipdoc['name']
 
     # Get hosts by ID's from relationship, open docs and print names if they exist
@@ -246,119 +303,8 @@ def write_config_file(config_dict):
         sys.exit(2)
     data.write(config_json)
     data.close()
-    print config['default_config_name'] +" written. This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
-    print "To initiate a scan using cron, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "' in order to have it scan based on these config settings."
-    
-# If first run, prompt user for information about scan: BROKEN- NEEDS TO INSERT HOST DOCUMENTS FIRST IN ORDER TO GET THEIR ID'S THEN CREATE RELATIONSHIP
-def create_initial_config_old():
-    # This host
-    this_host_name = raw_input("What is this host's 'friendly name?' > ")
-    # Check for existing host record(s)
-    
-    # If no host record exists, prompt for info about this host
-    this_host_ipv4 = raw_input("What is this host's rsync IPV4 address? > ") #needs input validation
-    this_host_ipv6 = raw_input("What is this host's rsync IPV6 address? (leave blank if N/A) > ") # needs input validation
-    this_host_dir = raw_input("What directory on this host is being sync'd? (full path) > ")
-    relationship_status = ""
-    # If source, ask if existing relationship is in place
-    while (relationship_status not in ("y", "Y", "n", "N")):
-        relationship_status = raw_input("Is this host part of an existing rsync relationship (y/n) > ")
-    # If yes, prompt to search for existing destination host and relationship
-    
-    if (relationship_status in ("y","Y")):
-        opposite_host_name = raw_input("What is the friendly name of the other host? (Set previously) > ")
-        # TO-DO: Iterate through host matches to find the correct one
-        opposite_host_ID = find_host(opposite_host_name)
-        this_host_ID = find_host(this_host_name)
-        # TO-DO: Once correct host is found, iterate through relationships to find the correct one (showing directories and source status)
-        relationship_ID = find_relationship(opposite_host_ID,this_host_ID)
-        
-    # If no, prompt for destination host friendly name and create host and relationship document in database
-    else:
-        this_host_source = ""
-        opposite_host_name = raw_input("Set a friendly name for the other host. (Used for setting up the other side) > ")
-        opposite_host_ipv4 = raw_input("Other host's rsync IPV4 address > ") # TO-DO: needs input validation
-        opposite_host_ipv6 = raw_input("Other host's rsync IPV6 address (leave blank if N/A) > ") # TO-DO: needs input validation
-        opposite_host_dir = raw_input("What directory on the other host is being sync'd? (full path) > ")
-        relationship_name = raw_input("Enter a memorable name for the sync relationship between these hosts > ")
-        print "Enter any rsync flags in use. (such as -a, --delete) List as single letters or words with dashes. Separate by spaces."
-        print "Do not list any that accept file input"
-        rsync_flags = raw_input(" > ")
-        rsync_excludes = raw_input("Enter full path to file of excluded files/directories that's fed to rsync using --excludes > ")
-        # Process flags into array
-        
-        # Process excludes file contents into array
-        
-        # Construct relationship document #BROKEN- HAS TO BE EXECUTED AFTER HOST CREATION IN ORDER TO OBTAIN THEIR UNIQUEIDS
-        while (this_host_source not in ("y", "Y", "n", "N")):
-            this_host_source = raw_input("Is the host we're on the source of the rsync data? (y/n) > ")
-        if (this_host_source in ("Y","y")):
-            relationship_document = {'type':'relationship', 'sourcehost':this_host_name, 'targethost':opposite_host_name, 'sourcedir':this_host_dir, 'targetdir':opposite_host_dir, 'active':true, 'name':relationship_name}
-        else:
-            relationship_document = {'type':'relationship', 'sourcehost':opposite_host_name, 'targethost':this_host_name, 'sourcedir':opposite_host_dir, 'targetdir':this_host_dir, 'active':true, 'name':relationship_name}
-
-        # Construct new host document for the opposite end
-        opposite_host_document = {'type':'host', 'ip4':opposite_host_ipv4, 'hostname':opposite_host_name, 'ip6':opposite_host_ipv6}
-
-        # Constrcut new host document for this host
-        this_host_document = {'type':'host', 'ip4':this_host_ipv4, 'ip6':this_host_ipv6, 'hostname':this_host_name}
-
-    # prompt for Cloudant URL and login parameters to obtain a new auth string
-    auth_not_set = 1
-    while (auth_not_set):
-        cloudant_user = raw_input("Enter Cloudant account name (DNS name before .cloudant.com) > ")
-        cloudant_login = raw_input("Enter login username (usually the account name) > ")
-        cloudant_pass = raw_input("Enter password > ")
-        usrPass = userid + ":" + password
-        cloudant_auth = base64.b64encode(usrPass)
-        test_URI = "https://" + cloudant_user + ".cloudant.com"
-        # Test auth by opening a cookie session, if not good try again
-        if (test_auth(test_URI, cloudant_login, cloudant_pass)):
-            auth_not_set = 0
-
-    # Print summary of changes to be written to database and config file to be created
-    passdisplay = "*" * len(cloudant_pass)
-    main_DB_URI = "https://" + cloudant_user + ".cloudant.com/rsynccheckpoint"
-    print "This is the information which will be stored in the configuration file and associated cloudant database:"
-    formatter = "%r : %r %r %r"
-    print formatter % ("This Host and IP", this_host_name, this_host_ipv4, this_host_ipv6)
-    print formatter % ("Opposite Host and IP", opposite_host_name, opposite_host_ipv4, opposite_host_ipv6)
-    print "Data will be flowing thus:"
-    formatter2 = "%r::%r -> %r::%r"
-    print formatter2 % (relationship_document['sourcehost'], relationship_document['sourcedir'], relationship_document['targethost'], relationship_document['targetdir'])
-    print "Rsync flags:" + rsync_flags
-    if (len(rsync_excludes) > 0):
-        print "Files/Dirs to exclude: " + rsync_excludes
-    print formatter % ("Database", main_DB_URI,"","")
-    print formatter % ("User",cloudant_user,"","")
-    print formatter % ("Pass",passdisplay,"","")
-    print "The configuration file 'dirscanconf.json' will be created in the current directory."
-    print "Be sure to move it where it will be readable by the script when called by cron."
-    while (approval not in ("y", "Y", "n", "N")):
-        approval = raw_input("Is this all correct? (Y/N) > ")
-    # If approved, execute writes and prompt to initiate first scan.
-    if (approval in ("n","N")):
-        print "Exiting..."
-        sys.exit()
-    else:
-        config_file_dir = {'mainDB':main_DB_URI, 'bulkthreshold': 10000, 'auth':cloudant_auth, 'relationship':relationshipID, 'thishost':hostID, 'description':"This JSON document is used by dirscan.py for it's operations. CHANGE WITH CAUTION!"}
-        # For future: Make threashold dependent upont number of total files during scan???
-        try:
-            config_file = open('dirscanconf.json', 'w')
-        except IOError as e:
-            print "I/O error({0}): {1}".format(e.errno, e.strerror)
-        sys.exit(2)
-        config_file.write(json.dumps(config_file_dir))
-        config_file.close()
-        if not (insert_single_doc_guid(this_host_document, main_DB_URI, cloudant_auth)):
-            print "Failed to insert document into database, exiting."
-            sys.exit()
-        if not (insert_single_doc_guid(opposite_host_document, main_DB_URI, cloudant_auth)):
-            print "Failed to insert document into database, exiting."
-            sys.exit()
-        if not (insert_single_doc_guid(relationship_document, main_DB_URI, cloudant_auth)):
-            print "Failed to insert document into database, exiting."
-            sys.exit()
+    print config['default_config_filename'] +" written."
+    print "This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
 
 # Load configuration from file and database into configuration dictionary
 def load_config(config_file):
@@ -400,23 +346,6 @@ def load_config(config_file):
     else:
         config['is_source'] = False
 
-# Create and delete a cookie session using the passed credentials to test login 
-def test_auth(baseURI, user, password):
-    fullURI = baseURI + "/_session"
-    fullheaders = {"Content-Type": "application/x-www-form-urlencoded"}
-    response = requests.post(
-        fullURI,
-        headers = fullheaders,
-        params = {'name': user, 'password': password}
-    )
-    if (response.status_code not in (200,201,202)):
-        return(False)
-    requests.delete(
-        fullURI,
-        headers = {"Content-Type": requests.cookies['AuthSession']}
-    )
-    return(True)
-
 # TO-DO: scan function with parameters passed
 def directory_scan():
     print "Not Implemented yet"
@@ -451,21 +380,101 @@ def directory_scan():
         # increment filecount and total size of scan variables
         # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
     # Write summary scan document to main database
+    sys.exit()
 
-# TO-DO: Create a relationship entity and write an associated document into the database
+# Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
-    print "Not implemented yet"
-    sys.exit()
+    with Document(db) as doc:
+        print " Let's define one then!"
+        print " Enter a name for this relationship"
+        doc['name'] = raw_input(" > ")
+        doc['type'] = 'relationship'
+        doc['active'] = False
+        doc['sourcehost'] = ''
+        doc['sourcedir'] = ''
+        doc['targethost'] = ''
+        doc['targetdir'] = ''
+        config['relationship'] = doc['_id']
+        
+        # If excludes file not specified at runtime
+        if len(config['rsync_excluded']) > 0:
+            # Prompt for list of files/directories to exclude, one per line
+            print "If you would like to exclude any files or directories from scanning, enter them one per line now."
+            print "(Enter when finished)"
+            exclude_line = ' '
+            while (len(exclude_line) > 0):
+                exclude_line = raw_input(" > ")
+                # Enter each into a new array, if line empty, finish
+                if (len(exclude_line) > 0):
+                    config['rsync_excluded'].append(exclude_line)
+        else:
+            # print first 3 entries and "...", informing user these will be used
+            print "Exclusions list has been read:"
+            count = 0
+            while (count < len(config['rsync_excluded']) and count < 3):
+                print config['rsync_excluded'][count]
+                count = count + 1
+            if (len(config['rsync_excluded']) > 3):
+                print "...and so on"
+            print "Matching paths will not be scanned on either the source or target hosts."
+            
+        # Write array of excluded paths to doc
+        doc['excludedfiles'] = config['rsync_excluded']
+        
+        # Set delete flag if in use    
+        if (raw_input(" Are deletions being sync'd? (Y/N) >") in ("y", "Y")):
+            doc['rsyncflags'].append('delete')
+            
+        # Input any other rsync flags in use
+        print " (Optional) What flags are being used by rsync?"
+        flags = raw_input(" (Enter on one line, no spaces): ")
+        for flag in flags:
+            doc['rsyncflags'].append(flag)
+            
+    # Return the doc _id of the new relationship
+    return config['relationship']    
     
-# TO-DO: Find a host by name
+# TO-DO: Find a host by name, using search index
 def find_host(host_name):
-    print "Not implemented yet"
-    sys.exit()
+    sys.exit("Not implemented")
 
-# TO-DO: Find a relationship by listing all known relationships and letting the user choose the appropriate one
-def list_relationships(cloudant_client):
-    print "Not implemented yet"
-    sys.exit()
+# Find a relationship by listing all known relationships and letting the user choose the appropriate one
+def list_relationships(db):
+    print "| Which relationship is this host part of?"
+    print "| ID | Relationship                       |"
+    
+    # Open view
+    with DesignDocument(db, maindb_views['all_relations'][0]) as ddoc:
+        with View(ddoc, maindb_views['all_relations'][1]) as view:
+            
+            # Iterate through relationships, storing and printing a key for each
+            relationship_key = 0
+            relationship_set = []
+            for row in view(include_docs=False, limit=10)['rows']:
+                relationship_key = relationship_key + 1
+                print "| " + relationship_key + " | " + row['key'][0]
+                relationship_set[relationship_key] = row['_id']
+                
+            # Ask user to select desired relationship from list
+            relationship_selected = -1
+            while (relationship_selected not in relationship_set):
+                relationship_selected = raw_input("| > ")
+        
+    # Pass back the appropriate relationship document _id
+    return relationship_set[relationship_selected]
+
+# Read in the excludes file passed at startup and store to the config array
+def get_excludes(filename):
+    try:
+        data = open(filename)
+    except IOError as e:
+        print "I/O error({0}): {1}".format(e.errno, e.strerror)
+        sys.exit(2)
+    for exclude in data:
+        if exclude.isspace():
+            next()
+        else:
+            config['rsync_excluded'].append(exclude)
     
 if __name__ == "__main__":
     main(sys.argv[1:])
@@ -522,4 +531,130 @@ if __name__ == "__main__":
 #        headers = fullheader
 #    )
 #    return(response)
-  
+# If first run, prompt user for information about scan: BROKEN- NEEDS TO INSERT HOST DOCUMENTS FIRST IN ORDER TO GET THEIR ID'S THEN CREATE RELATIONSHIP
+#def create_initial_config_old():
+#    # This host
+#    this_host_name = raw_input("What is this host's 'friendly name?' > ")
+#    # Check for existing host record(s)
+#    
+#    # If no host record exists, prompt for info about this host
+#    this_host_ipv4 = raw_input("What is this host's rsync IPV4 address? > ") #needs input validation
+#    this_host_ipv6 = raw_input("What is this host's rsync IPV6 address? (leave blank if N/A) > ") # needs input validation
+#    this_host_dir = raw_input("What directory on this host is being sync'd? (full path) > ")
+#    relationship_status = ""
+#    # If source, ask if existing relationship is in place
+#    while (relationship_status not in ("y", "Y", "n", "N")):
+#        relationship_status = raw_input("Is this host part of an existing rsync relationship (y/n) > ")
+#    # If yes, prompt to search for existing destination host and relationship
+#    
+#    if (relationship_status in ("y","Y")):
+#        opposite_host_name = raw_input("What is the friendly name of the other host? (Set previously) > ")
+#        # TO-DO: Iterate through host matches to find the correct one
+#        opposite_host_ID = find_host(opposite_host_name)
+#        this_host_ID = find_host(this_host_name)
+#        # TO-DO: Once correct host is found, iterate through relationships to find the correct one (showing directories and source status)
+#        relationship_ID = find_relationship(opposite_host_ID,this_host_ID)
+#        
+#    # If no, prompt for destination host friendly name and create host and relationship document in database
+#    else:
+#        this_host_source = ""
+#        opposite_host_name = raw_input("Set a friendly name for the other host. (Used for setting up the other side) > ")
+#        opposite_host_ipv4 = raw_input("Other host's rsync IPV4 address > ") # TO-DO: needs input validation
+#        opposite_host_ipv6 = raw_input("Other host's rsync IPV6 address (leave blank if N/A) > ") # TO-DO: needs input validation
+#        opposite_host_dir = raw_input("What directory on the other host is being sync'd? (full path) > ")
+#        relationship_name = raw_input("Enter a memorable name for the sync relationship between these hosts > ")
+#        print "Enter any rsync flags in use. (such as -a, --delete) List as single letters or words with dashes. Separate by spaces."
+#        print "Do not list any that accept file input"
+#        rsync_flags = raw_input(" > ")
+#        rsync_excludes = raw_input("Enter full path to file of excluded files/directories that's fed to rsync using --excludes > ")
+#        # Process flags into array
+#        
+#        # Process excludes file contents into array
+#        
+#        # Construct relationship document #BROKEN- HAS TO BE EXECUTED AFTER HOST CREATION IN ORDER TO OBTAIN THEIR UNIQUEIDS
+#        while (this_host_source not in ("y", "Y", "n", "N")):
+#            this_host_source = raw_input("Is the host we're on the source of the rsync data? (y/n) > ")
+#        if (this_host_source in ("Y","y")):
+#            relationship_document = {'type':'relationship', 'sourcehost':this_host_name, 'targethost':opposite_host_name, 'sourcedir':this_host_dir, 'targetdir':opposite_host_dir, 'active':true, 'name':relationship_name}
+#        else:
+#            relationship_document = {'type':'relationship', 'sourcehost':opposite_host_name, 'targethost':this_host_name, 'sourcedir':opposite_host_dir, 'targetdir':this_host_dir, 'active':true, 'name':relationship_name}
+#
+#        # Construct new host document for the opposite end
+#        opposite_host_document = {'type':'host', 'ip4':opposite_host_ipv4, 'hostname':opposite_host_name, 'ip6':opposite_host_ipv6}
+#
+#        # Constrcut new host document for this host
+#        this_host_document = {'type':'host', 'ip4':this_host_ipv4, 'ip6':this_host_ipv6, 'hostname':this_host_name}
+#
+#    # prompt for Cloudant URL and login parameters to obtain a new auth string
+#    auth_not_set = 1
+#    while (auth_not_set):
+#        cloudant_user = raw_input("Enter Cloudant account name (DNS name before .cloudant.com) > ")
+#        cloudant_login = raw_input("Enter login username (usually the account name) > ")
+#        cloudant_pass = raw_input("Enter password > ")
+#        usrPass = userid + ":" + password
+#        cloudant_auth = base64.b64encode(usrPass)
+#        test_URI = "https://" + cloudant_user + ".cloudant.com"
+#        # Test auth by opening a cookie session, if not good try again
+#        if (test_auth(test_URI, cloudant_login, cloudant_pass)):
+#            auth_not_set = 0
+#
+#    # Print summary of changes to be written to database and config file to be created
+#    passdisplay = "*" * len(cloudant_pass)
+#    main_DB_URI = "https://" + cloudant_user + ".cloudant.com/rsynccheckpoint"
+#    print "This is the information which will be stored in the configuration file and associated cloudant database:"
+#    formatter = "%r : %r %r %r"
+#    print formatter % ("This Host and IP", this_host_name, this_host_ipv4, this_host_ipv6)
+#    print formatter % ("Opposite Host and IP", opposite_host_name, opposite_host_ipv4, opposite_host_ipv6)
+#    print "Data will be flowing thus:"
+#    formatter2 = "%r::%r -> %r::%r"
+#    print formatter2 % (relationship_document['sourcehost'], relationship_document['sourcedir'], relationship_document['targethost'], relationship_document['targetdir'])
+#    print "Rsync flags:" + rsync_flags
+#    if (len(rsync_excludes) > 0):
+#        print "Files/Dirs to exclude: " + rsync_excludes
+#    print formatter % ("Database", main_DB_URI,"","")
+#    print formatter % ("User",cloudant_user,"","")
+#    print formatter % ("Pass",passdisplay,"","")
+#    print "The configuration file 'dirscanconf.json' will be created in the current directory."
+#    print "Be sure to move it where it will be readable by the script when called by cron."
+#    while (approval not in ("y", "Y", "n", "N")):
+#        approval = raw_input("Is this all correct? (Y/N) > ")
+#    # If approved, execute writes and prompt to initiate first scan.
+#    if (approval in ("n","N")):
+#        print "Exiting..."
+#        sys.exit()
+#    else:
+#        config_file_dir = {'mainDB':main_DB_URI, 'bulkthreshold': 10000, 'auth':cloudant_auth, 'relationship':relationshipID, 'thishost':hostID, 'description':"This JSON document is used by dirscan.py for it's operations. CHANGE WITH CAUTION!"}
+#        # For future: Make threashold dependent upont number of total files during scan???
+#        try:
+#            config_file = open('dirscanconf.json', 'w')
+#        except IOError as e:
+#            print "I/O error({0}): {1}".format(e.errno, e.strerror)
+#        sys.exit(2)
+#        config_file.write(json.dumps(config_file_dir))
+#        config_file.close()
+#        if not (insert_single_doc_guid(this_host_document, main_DB_URI, cloudant_auth)):
+#            print "Failed to insert document into database, exiting."
+#            sys.exit()
+#        if not (insert_single_doc_guid(opposite_host_document, main_DB_URI, cloudant_auth)):
+#            print "Failed to insert document into database, exiting."
+#            sys.exit()
+#        if not (insert_single_doc_guid(relationship_document, main_DB_URI, cloudant_auth)):
+#            print "Failed to insert document into database, exiting."
+#            sys.exit()
+#
+## Create and delete a cookie session using the passed credentials to test login - DEPRECATED
+#def test_auth(baseURI, user, password):
+#    fullURI = baseURI + "/_session"
+#    fullheaders = {"Content-Type": "application/x-www-form-urlencoded"}
+#    response = requests.post(
+#        fullURI,
+#        headers = fullheaders,
+#        params = {'name': user, 'password': password}
+#    )
+#    if (response.status_code not in (200,201,202)):
+#        return(False)
+#    requests.delete(
+#        fullURI,
+#        headers = {"Content-Type": requests.cookies['AuthSession']}
+#    )
+#    return(True)
