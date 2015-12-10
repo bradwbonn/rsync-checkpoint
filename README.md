@@ -20,3 +20,4 @@ A python scanning tool and Node.js visualization program to show how closely up-
 * Currently only supports one relationship per host pair. (only one directory sync per host pair)
 * An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated Cloudant docs from 'rsynccheckpoint' and per-diem database(s)
 * Input validation needed for numerous user-entry fields
+* Currently only 10 relationships are supported per account
