@@ -7,8 +7,9 @@ import base64
 import sys
 import datetime
 import time
-from cloudant import cloudant
-from getpass import getpass
+from cloudant.account import Cloudant
+import getpass
+#import requests
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -80,19 +81,21 @@ def main(argv):
             print "Loading " + config['passed_config_file']
         load_config(config['passed_config_file'])
         
-        # TO DO: Initiate scan
+        if (config['be_verbose']):
+            print config
+            print "Initiating scan now..."
+
+        # Initiate scan
         completion = directory_scan()
         
         # If scan completed successfully, output when verbose
-        if (completion):
-            scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
-            if (config['be_verbose']):
+        if (config['be_verbose']):
+            if (completion):
+                scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
                 print "Scan successfully completed at " + scanfinishtime
-            sys.exit()
-        else:
-            if (config['be_verbose']):
+            else:
                 print "Scan failure, see logs for details."
-            sys.exit()
+        sys.exit()
     else:
         newfile = raw_input("No configuration file specified. Do you wish to create one (Y/N) ? ")
         if (newfile in ('y','Y')):
@@ -101,36 +104,38 @@ def main(argv):
             print "Exiting..."
             sys.exit()
 
-# Obtain the username and password of the Cloudant account to use when creating the configuration file
-# Return the opened Cloudant class object for interaction
-def get_cloudant_auth():
-    auth_not_set = 1
-    while (auth_not_set):
-        print "You will need to have a Cloudant account created at www.cloudant.com to use this script."
-        cloudant_user = raw_input("Enter Cloudant account name (DNS name before .cloudant.com) > ")
-        cloudant_login = raw_input("Enter login username (often the same as the account name) > ")
-        cloudant_pass = getpass.getpass()
-        usrPass = userid + ":" + password
-        config['cloudant_auth_string'] = base64.b64encode(usrPass)
-        test_URI = "https://" + cloudant_user + ".cloudant.com"
-        # Test auth by opening a cookie session, if not good try again
-        if (test_auth(test_URI, cloudant_login, cloudant_pass)):
-            auth_not_set = 0
-            client = cloudant(cloudant_login,cloudant_pass, account=cloudant_user)
-            return client
-        else:
-            print "Login failed, please try again."
-
 # Assemble and write the JSON-formatted configuration file for the host we're running on
 def create_initial_config():
     # Initialize Cloudant client instance and obtain user credentials
-    client = get_cloudant_auth()
-    
+    auth_not_set = True
+    while (auth_not_set):
+        print "You will need a Cloudant account to use this script."
+        print "Go to www.cloudant.com to create one if you don't have it yet."
+        print "Enter Cloudant account name (DNS name before .cloudant.com):"
+        config['cloudant_user'] = raw_input("> ")
+        print "Enter login username (often the same as the account name):"
+        input_string = "["+ config['cloudant_user'] + "] > "
+        cloudant_login = raw_input(input_string)
+        if len(cloudant_login) == 0:
+            cloudant_login = config['cloudant_user']
+        cloudant_pass = getpass.getpass()
+        usrPass = cloudant_login + ":" + cloudant_pass
+        config['cloudant_auth_string'] = base64.b64encode(usrPass)
+        try:
+            client = Cloudant(cloudant_login, cloudant_pass, account=config['cloudant_user'])
+            client.connect()
+            auth_not_set = False
+        except Exception:
+            print "Sorry, try again."
+
     # Create database object for interaction
-    maindb = cloudant.database.CloudantDatabase(client, config['main_db_name'])
-    
-    # Create database if it doesn't exist (NO OP if it does)
-    maindb.create()
+    maindb = client(config['main_db_name'])
+    if maindb.exists():
+        if config['be_verbose'] == True:
+            print "Database found"
+    else:
+        # Create database if it doesn't exist (NO OP if it does)
+        maindb = client.create_database(config['main_db_name'])
     
     # Begin process of collecting data
     while (relationship_status not in ("y", "Y", "n", "N")):
@@ -138,7 +143,8 @@ def create_initial_config():
         
     # For cases where the relationship is already defined
     if (relationship_status in ("y","Y")):
-        # TO-DO: list relationships in database in pages, giving a line number for each for them to choose
+        # List relationships in database in pages, giving a line number for each for them to choose
+        # Get back a usable relationship document in Cloudant
         relationshipdoc = list_relationships(client)
         
         # Create this host's entry for the relationship at hand.
@@ -147,6 +153,7 @@ def create_initial_config():
         # Create a new relationship for use, then choose the relationship automatically and run host setup
         relationshipdoc = create_new_relationship(maindb)
         create_host_entry(maindb, relationshipdoc)
+    client.disconnect()
 
 # Take a given database and relationship document object and create a new host entry, plus write config file to local system
 def create_host_entry(db, relationshipdoc):
@@ -440,6 +447,10 @@ def directory_scan():
         # increment filecount and total size of scan variables
         # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
     # Write summary scan document to main database
+
+# TO-DO: Create a relationship entity and write an associated document into the database
+def create_new_relationship(db):
+    print "Not implemented yet"
     
 # TO-DO: Find a host by name
 def find_host(host_name):
@@ -449,7 +460,8 @@ def find_host(host_name):
 def list_relationships(cloudant_client):
     print "Not implemented yet"
     
-
+if __name__ == "__main__":
+    main(sys.argv[1:])
 # -------------------------------------------------------------------------------------------------------------------------
 # SCRATCH SPACE BELOW HERE
 # Insert a file document into the database using it's unique ID and adds the current timestamp
