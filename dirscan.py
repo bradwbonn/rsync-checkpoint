@@ -523,8 +523,13 @@ def directory_scan():
     if config['be_verbose'] == True:
         print "Beginning filesystem scan"
         
+    # HEAVY SCAN OPERATION BEGINS HERE
     # Iterate through directory structure
     for root, dirs, files in os.walk(this_scan['directory'], topdown=False):
+        # Prune any skipped files and directories from excludes list
+        dirs[:] = [d for d in dirs if d not in config['rsync_excluded']]
+        files[:] = [d for d in files if d not in config['rsync_excluded']]
+        
         for name in files:
             # Iterate counter for scan
             filecount = filecount + 1
@@ -610,8 +615,7 @@ def directory_scan():
                 
                 # Finished, add to array
                 file_doc_batch.append(filedict)
-                
-                            
+                                            
         # If we're at _bulk_docs threshold
         if ((filecount > 1) and (int(filecount) / int(config['threshold']) == int(filecount) / float('threshold'))):
             # write batch to database
@@ -623,6 +627,8 @@ def directory_scan():
     if len(file_doc_batch) > 0:
         scandb.bulk_docs(file_doc_batch)
         file_doc_batch = []
+    
+    # HEAVY SCAN OPERATION ENDS HERE
     
     # Update scan document with final results
     if this_scan['errorcount'] > 0:
