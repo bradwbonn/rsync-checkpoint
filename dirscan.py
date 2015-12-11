@@ -646,6 +646,9 @@ def directory_scan():
         scandoc[thisfield[0]] = thisfield[1]
     scandoc.save()
     
+    # Now that this scan is complete, wipe out any expired databases
+    purge_old_dbs(client)
+    
     # Close database out
     client.disconnect()
 
@@ -760,8 +763,23 @@ def get_excludes(filename):
             config['rsync_excluded'].append(exclude)
     
 # TO-DO: Check for scan databases older than retention threshold and delete them
-def purge_old_dbs():
+def purge_old_dbs(client):
     sys.exit("Not Implemented")
+    # Get list of databases in the account
+    dblist = client.all_dbs()
+    current_time = time.time()
+    # Permutate through all scandb database names and extract associated dates
+    for db in dblist:
+        if 'scandb-' not in db:
+            next()
+        else:
+            # If the extracted timestamp is older than the threshold
+            if (datetime.timedelta(current_time,db[7:]) > config['db_max_age']):
+                
+                # execute a database delete command
+                with Database(client,db) as doomed_db:
+                    doomed_db.delete()
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
