@@ -84,10 +84,10 @@ maindb_views = dict(
 # Views in each per-diem file dbs
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
 filedb_views = dict(
-    file_types = [  #FIX THIS SO IT DETERMINES EXTENSION
+    file_types = [
         '_design/files',
         'typesscanned',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.host, doc.scanID, filetype], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = fname.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
         '_stats'
     ],
     target_scanned = [
