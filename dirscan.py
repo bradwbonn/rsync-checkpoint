@@ -8,6 +8,7 @@ from base64 import b64encode
 import datetime
 import time
 from cloudant.account import Cloudant
+from cloudant import cloudant
 from getpass import getpass
 from os import walk
 from os import path
@@ -15,6 +16,8 @@ from os import path
 config = dict(
     # Name of database in Cloudant for everything except file entries
     main_db_name = 'rsynccheckpoint',
+    # Name of the database in Cloudant which we're using for scanning today
+    scan_db_name = '',
     # Number of docs per bulk request (Defaults to 2000 during initial configuration)
     doc_threshold = 2000,
     # Use this filename for configuration settings. JSON-formatted
@@ -33,6 +36,8 @@ config = dict(
     relationship = '',
     # ID of the current host (Cloudant doc _id)
     host_id = '',
+    # ID of the opposite host (Cloudant doc _id)
+    other_host_id = '',
     # Flags for current relationship's sync setup
     rsync_flags = '',
     # Ignored files and directories by rsync process for this relationship
@@ -55,17 +60,17 @@ config = dict(
 # Views in main database
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
 maindb_views = dict(
-    all_relations = ['relationships',
+    all_relations = ['_design/relationships',
                      'allrelations',
                      'function (doc) {if (doc.type === "relationship") { emit(doc.name, 1);}}',
                      None],
-    all_hosts = ['hosts',
+    all_hosts = ['_design/hosts',
                  'allhosts',
                  'function (doc) {if (doc.type === "host") { emit([doc.name, doc.ip4], 1);}}',
                  None],
-    recent_scans = ['scans',
+    recent_scans = ['_design/scans',
                     'recentscans',
-                    'function (doc) {if (doc.type === "scan" && doc.ended > 0) {emit([doc.host, doc.success, doc.started], doc.database);}}',
+                    'function (doc) {if (doc.type === "scan") {emit([doc.host, doc.success, doc.started], doc.database);}}',
                     None]
 )
 
@@ -73,9 +78,21 @@ maindb_views = dict(
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
 filedb_views = dict(
     file_types = [
-        'files',
+        '_design/files',
         'typesscanned',
-        'function (doc) { if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, doc.extension], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, doc.extension], doc.size); } }',
+        '_stats'
+    ],
+    target_scanned = [
+        '_design/scanresults',
+        'targetfiles',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false) {emit([doc.scanID, doc.orphaned, doc.stale], doc.size);}}',
+        '_stats'
+    ],
+    problem_files = [
+        '_design/files',
+        'problemfiles',
+        'function (doc) {if (doc.type === "file") {emit([doc.scanID,doc.goodscan], doc.size);}}',
         '_stats'
     ]
 )
@@ -99,7 +116,9 @@ def main(argv):
                 sys.exit(config['help_text'])
             config['passed_config_file'] = arg
         elif opt in ("-u"):
-            update = 1 # This doesn't do anything yet
+            # This doesn't do anything yet
+            # Eventually meant to be the parameter for an update to existing configuration
+            update = 1
         elif opt in ("-v"):
             config['be_verbose'] = True
         elif opt in ("-x"):
@@ -109,16 +128,16 @@ def main(argv):
     
     # If config file is specfied, read it in and execute scan
     if (len(config['passed_config_file']) > 0):
+        
         # Load configuration settings from file
         if (config['be_verbose']):
             print "Loading " + config['passed_config_file']
         load_config(config['passed_config_file'])
         
+        # Initiate scan
         if (config['be_verbose']):
             print config
             print "Initiating scan now..."
-
-        # Initiate scan
         completion = directory_scan()
         
         # If scan completed successfully, output when verbose
@@ -127,8 +146,12 @@ def main(argv):
                 scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
                 print "Scan successfully completed at " + scanfinishtime
             else:
-                print "Scan failure, see logs for details."
+                print "Scan aborted."
+        
+        # We're done here
         sys.exit()
+
+    # If no configuration file is passed, ask to run initialization process
     else:
         newfile = raw_input("No configuration file specified. Create? (Y/N) > ")
         if (newfile in ('y','Y')):
@@ -343,16 +366,80 @@ def load_config(config_file):
     # Set flag for whether we're scanning a source or target
     if (config['host_id'] == config['rsync_source']):
         config['is_source'] = True
+        config['other_host_id'] = config['rsync_target']
     else:
         config['is_source'] = False
+        config['other_host_id'] = config['rsync_source']
 
-# TO-DO: scan function with parameters passed
+# TO-DO: filesystem scan function 
 def directory_scan():
-    print "Not Implemented yet"
-    # Initialize by getting:
-        # Last successful scan document
-        # Current per-diem database (based on UTC)
+    sys.exit("Not implemented")
     
+    # Init local variables
+    this_scan = dict(
+        database = '',
+        started = time.time(),
+        ended = 0,
+        source = False,
+        type = 'scan',
+        success = False,
+        errorcount = 0,
+        hostID = config['host_id'],
+        directory = '',
+        directorysize = 0,
+        relationship = config['relationship'],
+        firstscan = True,
+        previousscanID = '',
+        filecount = 0
+    )
+    
+    if (config['is_source']):
+        this_scan['source'] = True
+        this_scan['directory'] = config['rsync_source_dir']
+    else:
+        this_scan['source'] = False
+        this_scan['directory'] = config['rsync_target_dir']
+        
+    # Initialize Cloudant connection
+    try:
+        client = Cloudant(config['cloudant_user'], config['cloudant_auth'])
+        client.connect()
+    except Exception:
+        sys.exit("FAIL: Unable to open connection to Cloudant")
+
+    # Open main database
+    try:
+        maindb = client[config['main_db_name']]
+    except Exception:
+        sys.exit("FAIL: Main database can't be found")
+
+    # Get this host's last successful scan info (if it exists)
+    thisview = maindb_views['recentscans']
+    beginhere = [config['host_id'],True,'']
+    endhere = [config['host_id'],True,{}]
+    with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
+        if len(raw_result) > 0:
+            this_scan['firstscan'] = False
+            this_scan['previousscanID'] = raw_result['_id']
+            last_scan_DB = raw_result['value']
+            last_scan_complete = raw_result['key'][2]
+    
+    # Get the other host's last scan info (if it exists, even if it's running)
+    beginhere = [config['other_host_id'],False,'']
+    endhere = [config['other_host_id'],True,{}]
+    with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
+        if len(raw_result) > 0:
+            other_host_last_scan = raw_result['_id']
+            other_host_last_scan_DB = raw_result['value']
+            other_host_last_scan_complete = raw_result['key'][2]
+
+    # TO-DO: Determine current scan database basis (based on UTC)         # LOGIC NEEDS TO BE DETERMINED
+        # Determine 
+    
+    # Create new scan document from this_scan dictionary and keep open for duration of scan
+    scandoc = maindb.create_document(this_scan)
+    
+    # For a source scan:
     # Iterate through directory structure
     # For each file:
         # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
@@ -362,7 +449,9 @@ def directory_scan():
         # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
     # Write summary scan document to main database
  
-    # For a destination scan:
+    # For a target scan:
+    # Get most recent source scan, regardless of completion
+        # 
     # Iterate through directory structure
     # For each file:
         # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
@@ -380,7 +469,7 @@ def directory_scan():
         # increment filecount and total size of scan variables
         # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
     # Write summary scan document to main database
-    sys.exit()
+
 
 # Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
@@ -478,6 +567,11 @@ def get_excludes(filename):
     
 if __name__ == "__main__":
     main(sys.argv[1:])
+
+
+
+
+
 # -------------------------------------------------------------------------------------------------------------------------
 # SCRATCH SPACE BELOW HERE
 # Insert a file document into the database using it's unique ID and adds the current timestamp

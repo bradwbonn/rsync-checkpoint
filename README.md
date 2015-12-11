@@ -11,12 +11,13 @@ A python scanning tool and Node.js visualization program to show how closely up-
 
 ## How to set up:
 * Port 443 must be open for HTTPS traffic from scanning hosts
-* Execute `dirscan.py -v` on each host in the rsync relationship. You can also include `-x <filename>` to pass a list of path entries for the scanner to skip. This is useful if you're ignoring some files/dirs through rsync `--exclude`.  You can also enter these manually during setup.
+* Execute `dirscan.py -v` on each host in the rsync relationship. You can also include `-x <filename>` to have it read the file containing a list of path entries for the scanner to skip. This is useful if you're ignoring some files/dirs through rsync `--exclude`.  You can also enter these manually during setup.
 * Follow prompts to set up the configuration file for the host and to define the relationship between them
 * Create a cron task (or manually execute) the scan using `dirscan.py -c dirscansync.json` as a user which has full local read access to directory being scanned
 
 ## Known Issues:
 * Admin account required to create database and populate views. API keys not yet implemented.
+* Running more than one scanner concurrently can be a serious performance drain.  Recommend using a lock file wrapper on cron task until one is implemented in-script.
 * Currently only supports one relationship per host pair. (only one directory sync per host pair)
 * An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated Cloudant docs from 'rsynccheckpoint' and per-diem database(s)
 * Input validation needed for numerous user-entry fields

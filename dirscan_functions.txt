@@ -11,9 +11,9 @@ Types of queries to check file sync status:
     -> Updates when scans complete
 3. Determine a sync completion percentage based on scan total size and count of non-stale, non-orphaned files against source files
     -> M/R view:
-        -> only "file" docs with goodscan=true
+        -> only "file" docs with goodscan=true and source=false
         -> "For each doc:
-            -> emit key=[<source>,<scanID>,<orphaned>,<stale>] value=<size>
+            -> emit key=[<scanID>,<orphaned>,<stale>] value=<size>
             -> reduce _stats()
 4. Determine if a scan is running by checking view for most recent scanID in files?  Check against latest completed scanID?
         
@@ -86,7 +86,6 @@ Types of queries to check file sync status:
   "previousscanID": <ID of scan that went before this one>
   "source": <true/false>
   "filecount": <total files scanned>
-  "totalsize": <total size of files scanned in bytes>
 
  Host document (main database)
  ID: <GUID>
