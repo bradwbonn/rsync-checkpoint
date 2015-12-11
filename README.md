@@ -1,5 +1,13 @@
 # rsync-checkpoint
 A python scanning tool and Node.js visualization program to show how closely up-to-date two directories are to one another.  Uses Cloudant as the database backend.  Cloudant DBaaS functions as the means by which each host will provide updates re: their filesystem contents.
+
+Go to [www.cloudant.com](http://www.cloudant.com) to create a free Cloudant account.  This system is designed to minimize the amount of activity on the database, so depending on the size of your filesystem and the frequency with which you scan, it may stay under the $50/month fee trigger.
+
+The python scripts all utilize the cloudant-python beta (2.0.0a4) library, available from:
+
+	pip install --pre cloudant
+	
+The deprecated (0.5.10) cloudant python library will not work with these scripts.
 ## Files:
 * dirscan.py - script that runs on each local system, also contains procedures to setup first configuration file
 ** Utilizes the new Cloudant Python library.
