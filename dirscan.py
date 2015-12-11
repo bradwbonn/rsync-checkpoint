@@ -83,7 +83,7 @@ filedb_views = dict(
     file_types = [  #FIX THIS SO IT DETERMINES EXTENSION
         '_design/files',
         'typesscanned',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, filetype], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.host, doc.scanID, filetype], doc.size); } }',
         '_stats'
     ],
     target_scanned = [
@@ -92,11 +92,11 @@ filedb_views = dict(
         'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false) {emit([doc.scanID, doc.orphaned, doc.stale], doc.size);}}',
         '_stats'
     ],
-    problem_files = [
+    problem_files = [ 
         '_design/files',
         'problemfiles',
-        'function (doc) {if (doc.type === "file") {emit([doc.scanID,doc.goodscan], doc.size);}}',
-        '_stats'
+        'function (doc) {if (doc.type === "file" && doc.goodscan === false) {emit([doc.scanID,doc.path,doc.name], 1);}}',
+        '_count'
     ],
     source_files = [
         '_design/sourcefiles',
@@ -484,7 +484,7 @@ def directory_scan():
             filedict['scanID'] = scandoc['_id']
             filedict['host'] = config['host_id']
             filedict['relationship'] = config['relationship']
-            filedict['path'] = root.split("/")
+            filedict['path'] = root
             
             # Obtain detailed stats on file from OS if possible
             try:

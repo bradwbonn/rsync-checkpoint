@@ -41,7 +41,7 @@ Types of queries to check file sync status:
  ID: <40-char-sha1-hash-of:host,filename,path><ScanDateAsUTCtimestamp>
  Fields:
   "filename": <case_sensitive_name_of_file>
-  "path": [relative,path,to,file,on,local,system,under,sync,directory]
+  "path": <relative/path/to/file/on/local/system/under/sync/directory>
   "host": <ID of matching host doc>
   "size": <size in bytes of file>
   "permissionsUNIX": <UNIX-style_permission_flag_code>  (i.e. 755)
