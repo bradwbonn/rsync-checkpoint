@@ -15,10 +15,10 @@ A python scanning tool and Node.js visualization program to show how closely up-
 * Follow prompts to set up the configuration file for the host and to define the relationship between them
 * Create a cron task (or manually execute) the scan using `dirscan.py -c dirscansync.json` as a user which has full local read access to directory being scanned
 
-## Known Issues:
+## Known Issues/Limitations:
 * Admin account required to create database and populate views. API keys not yet implemented.
 * Running more than one scanner concurrently can be a serious performance drain.  Recommend using a lock file wrapper on cron task until one is implemented in-script.
-* Currently only supports one relationship per host pair. (only one directory sync per host pair)
+* Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them
 * An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated Cloudant docs from 'rsynccheckpoint' and per-diem database(s)
 * Input validation needed for numerous user-entry fields
 * Currently only 10 relationships are supported per account
