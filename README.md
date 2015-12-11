@@ -14,9 +14,18 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * synccheck.py - script to view the status of an rsync relationship, either during or after scans by dirscan.py
 * dirsync.js - Webpage that reads from Cloudant DB to obtain current sync state between the two hosts
 
-## To-Do:
-* Finish dirscan.py - Config portion complete; Working on scan algorithm
-* Create visualization system 
+
+
+#### Example configuration file JSON
+
+	{
+		‘auth’: <base64 Auth String>,
+		‘cloudant_user': <Cloudant account name>,
+		‘relationship': <ID of host relationship>,
+		‘host_id’: <ID of host this file is for>,
+		‘threshold’: <number of docs per bulk post>,
+		‘maindbname’: <name of central sync database> # Currently not used
+	}
 
 ## How to set up:
 * Port 443 must be open for HTTPS traffic from scanning hosts
