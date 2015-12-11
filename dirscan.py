@@ -2,15 +2,19 @@
 
 # Prep
 import json
-from getopt import getopt
-from getopt import GetoptError
-from base64 import b64encode
+import getopt
+#from getopt import GetoptError
+import base64
+import sys
 import hashlib
 import datetime
 import time
 from cloudant.account import Cloudant
-from cloudant import cloudant
-from getpass import getpass
+from cloudant.design_document import DesignDocument
+from cloudant.result import Result
+from cloudant.document import Document
+import cloudant
+import getpass
 from os import walk
 from os import path
 
@@ -211,11 +215,26 @@ def create_initial_config():
         maindb = client.create_database(config['main_db_name'])
         if config['be_verbose'] == True:
             print "Database created"
-        
-        # Insert design documents for required indexes in main db
-        for view in maindb_views:
-            with DesignDocument(db, document_id=view[0]) as ddoc:
-                ddoc.add_view(view[1], view[2], reduce_func=view[3])
+            
+    wait = True
+    while (wait):
+        if (maindb.exists()):
+            wait = False
+        else:
+            if config['be_verbose'] == True:
+                print "Waiting for database to become available..."
+            time.sleep(10)
+            
+    # Insert design documents for required indexes in main db
+    # Allow for a possible failure due to lag between database creation and usability
+    for viewname in maindb_views:
+        view = maindb_views[viewname]
+        try:
+            ddoc = DesignDocument(maindb, document_id=view[0])
+            ddoc.add_view(view[1], view[2], reduce_func=view[3])
+            ddoc.save()
+        except Exception:
+            sys.exit("Cannot insert design document: " + view[0])
     
     # Begin process of collecting data
     relationship_status = ''
@@ -260,14 +279,22 @@ def create_host_entry(db, relationshipdocID):
     # Get hosts by ID's from relationship, open docs and print names if they exist
     config_count = 0
     if (relationshipdoc['sourcehost'] != "UNDEFINED"):
-        print "Source host: " + sourcedoc['hostname']
-        config_count = config_count + 1
+        try:
+            with Document(db, document_id=relationshipdoc['sourcehost']) as sourcedoc:
+                print "Source host: " + sourcedoc['hostname']
+            config_count = config_count + 1
+        except:
+            sys.exit("ERROR: Looks like that relationship's source host is no longer present.")
     else:
         print "Source host: NOT CONFIGURED"
         
     if (relationshipdoc['targethost'] != "UNDEFINED"):
-        print "Target host: " + targetdoc['hostname']
-        config_count = config_count + 1
+        try:
+            with Document(db, document_id=relationshipdoc['targethost']) as targetdoc:
+                print "Target host: " + targetdoc['hostname']
+            config_count = config_count + 1
+        except:
+            sys.exit("ERROR: Looks like that relationship's target host is no longer present.")
     else:
         print "Target host: NOT CONFIGURED"
        
@@ -289,13 +316,15 @@ def create_host_entry(db, relationshipdocID):
     # validate_path(this_host_directory)
     
     # Create the new host document in the database and get it's ID
-    with Document(db) as sourcedoc:
-        sourcedoc['type'] = 'host'
-        sourcedoc['hostname'] = new_hostname
-        sourcedoc['ip4'] = this_host_IP4
-        sourcedoc['ip6'] = this_host_IP6
-        sourcedoc.create()
-        new_host_ID = sourcedoc['_id']
+    # TO-DO: CHECK TO SEE IF I CAN DO THIS WITH A DICT INSERT
+    hostdoc = Document(db)
+    hostdoc.create()
+    hostdoc['type'] = 'host'
+    hostdoc['hostname'] = new_hostname
+    hostdoc['ip4'] = this_host_IP4
+    hostdoc['ip6'] = this_host_IP6
+    new_host_ID = hostdoc['_id']
+    hostdoc.save()
         
     # Update the relationship document
     if (is_this_source in ("Y","y")):
@@ -307,12 +336,12 @@ def create_host_entry(db, relationshipdocID):
         which_host = 'targethost'
         which_dir = 'targetdir'
     relationshipdoc.update_field(
-        action = doc.field_set,
+        action = relationshipdoc.field_set,
         field = which_host,
         value = new_host_ID
     )
     relationshipdoc.update_field(
-        action = doc.field_set,
+        action = relationshipdoc.field_set,
         field = which_dir,
         value = this_host_directory
     )
@@ -331,13 +360,13 @@ def create_host_entry(db, relationshipdocID):
 
 # Write a JSON-formatted file with the passed configuration settings
 def write_config_file(config_dict):
-    config_json = json.dump(config_dict)
+    # config_json = json.dump(config_dict)
     try:
-        data = open(config['default_config_filename'])
+        data = open(config['default_config_filename'], 'w')
     except IOError as e:
         print "I/O error({0}): {1}".format(e.errno, e.strerror)
         sys.exit(2)
-    data.write(config_json)
+    json.dump(config_dict, data)
     data.close()
     print config['default_config_filename'] +" written."
     print "This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
@@ -670,53 +699,57 @@ def compute_file_hash(fname):
     
 # Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
-    with Document(db) as doc:
-        print " Let's define one then!"
-        print " Enter a name for this relationship"
-        doc['name'] = raw_input(" > ")
-        doc['type'] = 'relationship'
-        doc['active'] = False
-        doc['sourcehost'] = ''
-        doc['sourcedir'] = ''
-        doc['targethost'] = ''
-        doc['targetdir'] = ''
-        config['relationship'] = doc['_id']
+    doc = Document(db)
+    doc.create()
+    print " Let's define one then!"
+    print " Enter a name for this relationship"
+    doc['name'] = raw_input(" > ")
+    doc['type'] = 'relationship'
+    doc['active'] = False
+    doc['sourcehost'] = 'UNDEFINED'
+    doc['sourcedir'] = ''
+    doc['targethost'] = 'UNDEFINED'
+    doc['targetdir'] = ''
+    doc['rsyncflags'] = []
+    config['relationship'] = doc['_id']
+    
+    # If excludes file not specified at runtime
+    if len(config['rsync_excluded']) == 0:
+        # Prompt for list of files/directories to exclude, one per line
+        print "If you would like to exclude any files or directories from scanning, enter them one per line now."
+        print "(Enter when finished)"
+        exclude_line = ' '
+        while (len(exclude_line) > 0):
+            exclude_line = raw_input(" > ")
+            # Enter each into a new array, if line empty, finish
+            if (len(exclude_line) > 0):
+                config['rsync_excluded'].append(exclude_line)
+    else:
+        # print first 3 entries and "...", informing user these will be used
+        print "Exclusions list has been read:"
+        count = 0
+        while (count < len(config['rsync_excluded']) and count < 3):
+            print config['rsync_excluded'][count]
+            count = count + 1
+        if (len(config['rsync_excluded']) > 3):
+            print "...and so on"
+        print "Matching paths will not be scanned on either the source or target hosts."
         
-        # If excludes file not specified at runtime
-        if len(config['rsync_excluded']) > 0:
-            # Prompt for list of files/directories to exclude, one per line
-            print "If you would like to exclude any files or directories from scanning, enter them one per line now."
-            print "(Enter when finished)"
-            exclude_line = ' '
-            while (len(exclude_line) > 0):
-                exclude_line = raw_input(" > ")
-                # Enter each into a new array, if line empty, finish
-                if (len(exclude_line) > 0):
-                    config['rsync_excluded'].append(exclude_line)
-        else:
-            # print first 3 entries and "...", informing user these will be used
-            print "Exclusions list has been read:"
-            count = 0
-            while (count < len(config['rsync_excluded']) and count < 3):
-                print config['rsync_excluded'][count]
-                count = count + 1
-            if (len(config['rsync_excluded']) > 3):
-                print "...and so on"
-            print "Matching paths will not be scanned on either the source or target hosts."
-            
-        # Write array of excluded paths to doc
-        doc['excludedfiles'] = config['rsync_excluded']
+    # Write array of excluded paths to doc
+    doc['excludedfiles'] = config['rsync_excluded']
+    
+    # Set delete flag if in use    
+    if (raw_input(" Are deletions being sync'd? (Y/N) >") in ("y", "Y")):
+        doc['rsyncflags'].append('delete')
         
-        # Set delete flag if in use    
-        if (raw_input(" Are deletions being sync'd? (Y/N) >") in ("y", "Y")):
-            doc['rsyncflags'].append('delete')
-            
-        # Input any other rsync flags in use
-        print " (Optional) What flags are being used by rsync?"
-        flags = raw_input(" (Enter on one line, no spaces): ")
-        for flag in flags:
-            doc['rsyncflags'].append(flag)
-            
+    # Input any other rsync flags in use
+    print " (Optional) What flags are being used by rsync?"
+    flags = raw_input(" (Enter on one line, no spaces): ")
+    for flag in flags:
+        doc['rsyncflags'].append(flag)
+    
+    # Save changes to document
+    doc.save()
     # Return the doc _id of the new relationship
     return config['relationship']    
     
