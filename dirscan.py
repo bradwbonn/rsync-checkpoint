@@ -5,6 +5,7 @@ import json
 from getopt import getopt
 from getopt import GetoptError
 from base64 import b64encode
+import hashlib
 import datetime
 import time
 from cloudant.account import Cloudant
@@ -54,7 +55,9 @@ config = dict(
     source_ip = '',
     target_ip = '',
     # Flag for whether we're scanning a source or target
-    is_source = True
+    is_source = True,
+    # Ultra-scan option. As in ULTRA-SLOW.  But performs 100% certainty of data integrity
+    ultra_scan = False
 )
 
 # Views in main database
@@ -77,10 +80,10 @@ maindb_views = dict(
 # Views in each per-diem file dbs
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
 filedb_views = dict(
-    file_types = [
+    file_types = [  #FIX THIS SO IT DETERMINES EXTENSION
         '_design/files',
         'typesscanned',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, doc.extension], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { emit([doc.scanID, filetype], doc.size); } }',
         '_stats'
     ],
     target_scanned = [
@@ -94,6 +97,12 @@ filedb_views = dict(
         'problemfiles',
         'function (doc) {if (doc.type === "file") {emit([doc.scanID,doc.goodscan], doc.size);}}',
         '_stats'
+    ],
+    source_files = [
+        '_design/sourcefiles',
+        'sourcefiles',
+        'function (doc) { if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc.id, doc.datemodified); }}',
+        None
     ]
 )
 
@@ -433,44 +442,166 @@ def directory_scan():
             other_host_last_scan_DB = raw_result['value']
             other_host_last_scan_complete = raw_result['key'][2]
 
-    # TO-DO: Determine current scan database basis (based on UTC)         # LOGIC NEEDS TO BE DETERMINED
-        # Determine 
-    
+    # TO-DO: Determine current scan database basis (based on UTC)         # LOGIC NEEDS TO BE VETTED
+    # If other host has begun a scan, and selected database is NOT older than 30 days
+        # Use the same database as the other host for this_scan
+
+    # Else if the other host has begun a scan, and the selected database is older than 30 days
+        # Create a new database for this week
+        # Populate filedb_views
+        # Set database name for this_scan
+
+    # Else If there is no prior scan for either host
+        # Create a new database for this week
+        # Populate filedb_views
+        # Set database name for this_scan
+
+
     # Create new scan document from this_scan dictionary and keep open for duration of scan
     scandoc = maindb.create_document(this_scan)
     
-    # For a source scan:
-    # Iterate through directory structure
-    # For each file:
-        # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
-        # Build document structure, adding: host,datescanned,relationship,scanID,scansuccess,source
-        # Add document to dictionary object
-        # increment filecount and total size of scan variables
-        # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
-    # Write summary scan document to main database
- 
-    # For a target scan:
-    # Get most recent source scan, regardless of completion
-        # 
-    # Iterate through directory structure
-    # For each file:
-        # Obtain all relevant file information (name,extension,path,size,permissions,owner,group,datemodified)
-        # Check against source file in database
-        #  If, the UTC Timestamp of asc=false,limit=1 of the source file ID queried is >= last successful scan,
-        #            then orphaned="no",
-        #        If the UTC timestamp is < last successful COMPLETED scan ID, then orphaned="yes"
-        #        If the file returns as non-existent in the database based on that ID (in other words, the string returned
-        #            does not match the startkey sent to the query), then orphaned="unknown"
-        # Check the scanned file's modified date against the most recent source version. If source is newer,
-        #           OR if the latest source scan is older than <threshold>, then stale=true, otherwise stale=false.
-        #           If file is orphaned, skip this check and set stale=true
-        # Build document structure, adding: host,datescanned,relationship,scanID,scansuccess,notsource,stale,orphaned
-        # Add document to dictionary object
-        # increment filecount and total size of scan variables
-        # If dictionary has threshold docs, or on last doc, upload via _bulk_docs API to current per-diem database
-    # Write summary scan document to main database
+    # Open the scan database
+    scandb = client[this_scan['database']]
 
+    # Total files scanned counter
+    filecount = 0
+    
+    # Dictionary of document dictionaries scanned
+    file_doc_batch = []
+    
+    if config['be_verbose'] == True:
+        print "Beginning filesystem scan"
+        
+    # Iterate through directory structure
+    for root, dirs, files in os.walk(this_scan['directory'], topdown=False):
+        for name in files:
+            # Iterate counter for scan
+            filecount = filecount + 1
+            
+            # Obtain base file information and store into dict
+            filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), this_scan['started'])
+            filedict['name'] = name
+            filedict['scanID'] = scandoc['_id']
+            filedict['host'] = config['host_id']
+            filedict['relationship'] = config['relationship']
+            filedict['path'] = root.split("/")
+            
+            # Obtain detailed stats on file from OS if possible
+            try:
+                stat = os.stat(os.path.join(root,name))
+                filedict['datescanned'] = time.time()
+                filedict['size'] = stat['st_size']
+                filedict['permissionsUNIX'] = stat['st_mode']
+                filedict['datemodified'] = stat['st_mtime']
+                filedict['owner'] = stat['st_uid']
+                filedict['group'] = stat['st_gid']
+                filedict['goodscan'] = True
+                this_scan['directorysize'] = this_scan['directorysize'] + filedict['size']
+                if (config['ultra_scan'] == True):
+                    filedict['checksum'] = compute_file_hash(os.path.join(root,name))
+            except:
+                # permissions problem most likely, store as bad scan of file and iterate errors
+                filedict['goodscan'] = False
+                this_scan['errorcount'] = this_scan['errorcount'] + 1
+                
+            if (config['is_source']):
+                # We're done scanning this file.  Put it into the array.
+                filedict['source'] = True
+                file_doc_batch.append(filedict)
 
+            else:
+                # We're on a target host, so we aren't finished yet.
+                filedict['source'] = False
+                
+                # Check for source file scanned in database
+                source_id_hash = hashlib.sha1(join(config['other_host_id'],os.path.join(root,name))).hexdigest()
+                source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
+                
+                # If file has been scanned:
+                if len(source_file) > 0:
+                    # Get the file's Scan timestamp from it's ID
+                    sfst = source_file['_id'][40:]
+                    source_file_scan_time = int(sfst)
+                    
+                    # If the file scan timestamp is >= last successful scan date
+                    if (source_file_scan_time >= other_host_last_scan_complete):
+                        # It's not orphaned
+                        filedict['orphaned'] = 'no'
+
+                        # But to determine if it's stale, check the scanned file's modified date against the most recent source version.
+                        thisview = filedb_views['sourcefiles']
+                        result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
+                        
+                        if (result['value'] > filedict['datemodified']):
+                            # If source is newer,
+                            # In future, this may also include if the latest source scan is older than a configured age threshold
+                            filedict['stale'] = True
+                        else:
+                            # If source is same or older age, it's up-to-date
+                            filedict['stale'] = False
+    
+                    # Else if the timestamp is < last successful completed scan ID for host
+                    # File is orphaned and automatically stale
+                    else:
+                        filedict['orphaned'] = 'yes'
+                        filedict['stale'] = True
+
+                # If the file hasn't ever been scanned on the source we don't know what it's status is
+                else:
+                    filedict['orphaned'] = "unknown"
+                    filedict['stale'] = False
+                
+                # Finished, add to array
+                file_doc_batch.append(filedict)
+                
+                            
+        # If we're at _bulk_docs threshold
+        if ((filecount > 1) and (int(filecount) / int(config['threshold']) == int(filecount) / float('threshold'))):
+            # write batch to database
+            scandb.bulk_docs(file_doc_batch)
+            # flush batch array
+            file_doc_batch = []
+
+    # Insert any remaining documents below the threshold
+    if len(file_doc_batch) > 0:
+        scandb.bulk_docs(file_doc_batch)
+        file_doc_batch = []
+    
+    # Update scan document with final results
+    if this_scan['errorcount'] > 0:
+        this_scan['success'] = False
+    else:
+        this_scan['success'] = True
+    updates = [
+        ['errorcount',this_scan['errorcount']],
+        ['filecount',this_scan['filecount']],
+        ['directorysize',this_scan['directorysize']],
+        ['ended',time.time()],
+        ['success', this_scan['success']]
+    ]
+    for thisfield in updates:
+        scandoc[thisfield[0]] = thisfield[1]
+    scandoc.save()
+    
+    # Close database out
+    client.disconnect()
+
+# Return the unique ID for a file based upon hash and last scan timestamp
+# Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the most recent UTC
+def get_file_id(host_id, full_path, timestamp):
+    filehash = hashlib.sha1(join(host_id,full_path)).hexdigest()
+    return (join(filehash,timestamp))
+
+# Insanely-slow but ultra-effective scanner process that computes an md5 hash of every file it encounters
+# Currently this option is hard-coded to be disabled.
+# I might incorporate it as an option if performance isn't TOO awful
+def compute_file_hash(fname):
+    filehash = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            filehash.update(chunk)
+    return filehash.hexdigest()
+    
 # Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
     with Document(db) as doc:
@@ -567,8 +698,6 @@ def get_excludes(filename):
     
 if __name__ == "__main__":
     main(sys.argv[1:])
-
-
 
 
 

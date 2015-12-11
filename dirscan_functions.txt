@@ -41,7 +41,6 @@ Types of queries to check file sync status:
  ID: <40-char-sha1-hash-of:host,filename,path><ScanDateAsUTCtimestamp>
  Fields:
   "filename": <case_sensitive_name_of_file>
-  "extension": <case-insensitive-file-extension>
   "path": [relative,path,to,file,on,local,system,under,sync,directory]
   "host": <ID of matching host doc>
   "size": <size in bytes of file>
@@ -57,7 +56,7 @@ Types of queries to check file sync status:
   "goodscan": <true/false>
   "checksum": <file checksum based on contents>  #Only used if ultra-check in place
   "source": <true/false>  (true if directory being scanned is the source of the mirror)
-  "hidden": <true/false> (use for dotfiles or dotdirs)
+  "hidden": <true/false> (use for dotfiles or dotdirs) # NOT IN USE CURRENTLY
   "orphaned": <"yes"/"no"/"unknown"> (If source file, always "no")
             ON A DESTINATION REPLICA: (source=false)
                 If, the UTC Timestamp of asc=false,limit=1 of the source file ID queried is >= last successful scan,
