@@ -57,7 +57,11 @@ config = dict(
     # Flag for whether we're scanning a source or target
     is_source = True,
     # Ultra-scan option. As in ULTRA-SLOW.  But performs 100% certainty of data integrity
-    ultra_scan = False
+    ultra_scan = False,
+    # Time threshold to being writing to a new scan database in seconds (default is 30 days)
+    db_rollover = 2592000,
+    # Time threshold to retain older scan databases for in seconds (default is 90 days)
+    db_max_age = 7776000
 )
 
 # Views in main database
@@ -428,33 +432,73 @@ def directory_scan():
     endhere = [config['host_id'],True,{}]
     with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
         if len(raw_result) > 0:
+            this_host_scanned = True
             this_scan['firstscan'] = False
             this_scan['previousscanID'] = raw_result['_id']
             last_scan_DB = raw_result['value']
             last_scan_complete = raw_result['key'][2]
+        else:
+            this_host_scanned = False
     
     # Get the other host's last scan info (if it exists, even if it's running)
     beginhere = [config['other_host_id'],False,'']
     endhere = [config['other_host_id'],True,{}]
     with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
         if len(raw_result) > 0:
+            other_host_scanned = True
             other_host_last_scan = raw_result['_id']
             other_host_last_scan_DB = raw_result['value']
             other_host_last_scan_complete = raw_result['key'][2]
+        else:
+            other_host_scanned = False
+        
+    # Determine current scan database basis
+    # General idea is to use the same database as the other host is currently using, provided that the database isn't older than one month.
+    # If the current scanning host sees that the database is too old, it'll create a new one and start inserting documents into it.  Until the
+    # other host runs another scan and sees that there's a newer DB in use by the other host, we read from the older database during the check
+    # for the state of a target file when needed.
 
-    # TO-DO: Determine current scan database basis (based on UTC)         # LOGIC NEEDS TO BE VETTED
-    # If other host has begun a scan, and selected database is NOT older than 30 days
-        # Use the same database as the other host for this_scan
-
-    # Else if the other host has begun a scan, and the selected database is older than 30 days
+    # Database naming format: join('scandb-',<UTC Timestamp>)
+        
+    # Database creation function
+    def new_scan_db():
         # Create a new database for this week
+        new_scan_db_name = join('scandb-',time.time())
+        try:
+            new_scan_db = client.create_database(new_scan_db_name)
+        except Exception:
+            sys.exit("FATAL: Cannot create new temporal scan database")
+            
         # Populate filedb_views
+        for thisview in scandb_views:
+            with DesignDocument(db, document_id=view[0]) as ddoc:
+                ddoc.add_view(view[1], view[2], reduce_func=view[3])
+                
         # Set database name for this_scan
-
+        this_scan['database'] = new_scan_db_name
+        
+    # If other host has begun a scan: 
+    if (other_host_scanned):
+        # and selected database is NOT older than 30 days:
+        if (datetime.timedelta(time.time(),other_host_last_scan_DB[7:]) < config['db_rollover']):
+            
+            # Use the same database as the other host for this_scan
+            this_scan['database'] = other_host_last_scan_DB
+            
+        # Else if the other host has begun a scan, and the selected database is older than 30 days
+        if (datetime.timedelta(time.time(),other_host_last_scan_DB[7:]) >= config['db_rollover']):
+            
+            # Create a new database
+            new_scan_db()
+            
     # Else If there is no prior scan for either host
-        # Create a new database for this week
-        # Populate filedb_views
-        # Set database name for this_scan
+    elif (not this_host_scanned and not other_host_scanned):
+        # create a new database
+        new_scan_db()
+        
+    else:
+        # Something has gone horribly wrong
+        sys.exit("FATAL: Database selection logic unresolvable")
 
 
     # Create new scan document from this_scan dictionary and keep open for duration of scan
@@ -462,6 +506,13 @@ def directory_scan():
     
     # Open the scan database
     scandb = client[this_scan['database']]
+    
+    # If the other host is using an older DB, set the flag and open it
+    if (this_scan['database'] != other_host_last_scan_DB):
+        db_skew = True
+        older_scandb = client[other_host_last_scan_DB]
+    else:
+        db_skew = False
 
     # Total files scanned counter
     filecount = 0
@@ -513,9 +564,12 @@ def directory_scan():
                 # We're on a target host, so we aren't finished yet.
                 filedict['source'] = False
                 
-                # Check for source file scanned in database
+                # Check for source file scanned in database 
                 source_id_hash = hashlib.sha1(join(config['other_host_id'],os.path.join(root,name))).hexdigest()
-                source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
+                if db_skew:
+                    source_file = older_scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
+                else:
+                    source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
                 
                 # If file has been scanned:
                 if len(source_file) > 0:
@@ -530,7 +584,10 @@ def directory_scan():
 
                         # But to determine if it's stale, check the scanned file's modified date against the most recent source version.
                         thisview = filedb_views['sourcefiles']
-                        result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
+                        if db_skew:
+                            result = older_scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
+                        else:
+                            result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
                         
                         if (result['value'] > filedict['datemodified']):
                             # If source is newer,
@@ -696,188 +753,10 @@ def get_excludes(filename):
         else:
             config['rsync_excluded'].append(exclude)
     
+# TO-DO: Check for scan databases older than retention threshold and delete them
+def purge_old_dbs():
+    sys.exit("Not Implemented")
+
 if __name__ == "__main__":
     main(sys.argv[1:])
 
-
-
-# -------------------------------------------------------------------------------------------------------------------------
-# SCRATCH SPACE BELOW HERE
-# Insert a file document into the database using it's unique ID and adds the current timestamp
-# NOT LIKELY TO BE USED DUE TO BULK API USAGE
-#def insert_file_doc(dictionary, baseURI, db, auth64creds, fileid):
-#    fullURI = baseURI + "/" + db + "/" + fileid + time.time()
-#    response = requests.put(
-#        fullURI,
-#        data=json.dumps(dictionary),
-#        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-#    )
-#    if (response.status_code in (202,201,200)):
-#        return(True)
-#    else:
-#        print "Bulk upload failure: " + response.status_code
-#        return(False)
-
-## Insert a document into the database, passing the dictionary object, URI (including database), and base64 auth string, returns true if successful
-## DEPRECATED, USING CLOUDANT LIB create_document()
-#def insert_single_doc_guid(dictionary, URI, auth64creds):
-#    response = requests.post(
-#        URI,
-#        data=json.dumps(dictionary),
-#        headers={"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-#    )
-#    if (response.status_code in (202,201,200)):
-#        return(True)
-#    else:
-#        print "Could not insert document: " + response.status_code + response.json()["error"]
-#        return(False)
-#
-## Upload a batch of source file documents using the bulk API, return HTTP status code
-## DEPRECATED, USING CLOUDANT LIB bulk_docs()
-#def insert_source_batch(doc_array, baseURI, db, auth64creds):
-#    fullURI = baseURI + "/" + db + "/" + "_bulk_docs"
-#    fullheaders = {"Content-Type": "application/json","Authorization": "Basic "+auth64creds}
-#    response = requests.post(
-#        fullURI,
-#        data={"docs": doc_array},
-#        headers=fullheaders
-#    )
-#    return(response.status_code)
-#
-## Returns the requests object for the associated document
-## DEPRECATED, USING CLOUDANT LIB fetch()
-#def get_doc_by_ID(account, database, auth, docID):
-#    fullURI = "https://" + account + ".cloudant.com/" + database + "/" + docID
-#    fullheader = {"Content-Type":"application/json","Authentication":"Basic "+auth}
-#    response = requests.get(
-#        URI,
-#        headers = fullheader
-#    )
-#    return(response)
-# If first run, prompt user for information about scan: BROKEN- NEEDS TO INSERT HOST DOCUMENTS FIRST IN ORDER TO GET THEIR ID'S THEN CREATE RELATIONSHIP
-#def create_initial_config_old():
-#    # This host
-#    this_host_name = raw_input("What is this host's 'friendly name?' > ")
-#    # Check for existing host record(s)
-#    
-#    # If no host record exists, prompt for info about this host
-#    this_host_ipv4 = raw_input("What is this host's rsync IPV4 address? > ") #needs input validation
-#    this_host_ipv6 = raw_input("What is this host's rsync IPV6 address? (leave blank if N/A) > ") # needs input validation
-#    this_host_dir = raw_input("What directory on this host is being sync'd? (full path) > ")
-#    relationship_status = ""
-#    # If source, ask if existing relationship is in place
-#    while (relationship_status not in ("y", "Y", "n", "N")):
-#        relationship_status = raw_input("Is this host part of an existing rsync relationship (y/n) > ")
-#    # If yes, prompt to search for existing destination host and relationship
-#    
-#    if (relationship_status in ("y","Y")):
-#        opposite_host_name = raw_input("What is the friendly name of the other host? (Set previously) > ")
-#        # TO-DO: Iterate through host matches to find the correct one
-#        opposite_host_ID = find_host(opposite_host_name)
-#        this_host_ID = find_host(this_host_name)
-#        # TO-DO: Once correct host is found, iterate through relationships to find the correct one (showing directories and source status)
-#        relationship_ID = find_relationship(opposite_host_ID,this_host_ID)
-#        
-#    # If no, prompt for destination host friendly name and create host and relationship document in database
-#    else:
-#        this_host_source = ""
-#        opposite_host_name = raw_input("Set a friendly name for the other host. (Used for setting up the other side) > ")
-#        opposite_host_ipv4 = raw_input("Other host's rsync IPV4 address > ") # TO-DO: needs input validation
-#        opposite_host_ipv6 = raw_input("Other host's rsync IPV6 address (leave blank if N/A) > ") # TO-DO: needs input validation
-#        opposite_host_dir = raw_input("What directory on the other host is being sync'd? (full path) > ")
-#        relationship_name = raw_input("Enter a memorable name for the sync relationship between these hosts > ")
-#        print "Enter any rsync flags in use. (such as -a, --delete) List as single letters or words with dashes. Separate by spaces."
-#        print "Do not list any that accept file input"
-#        rsync_flags = raw_input(" > ")
-#        rsync_excludes = raw_input("Enter full path to file of excluded files/directories that's fed to rsync using --excludes > ")
-#        # Process flags into array
-#        
-#        # Process excludes file contents into array
-#        
-#        # Construct relationship document #BROKEN- HAS TO BE EXECUTED AFTER HOST CREATION IN ORDER TO OBTAIN THEIR UNIQUEIDS
-#        while (this_host_source not in ("y", "Y", "n", "N")):
-#            this_host_source = raw_input("Is the host we're on the source of the rsync data? (y/n) > ")
-#        if (this_host_source in ("Y","y")):
-#            relationship_document = {'type':'relationship', 'sourcehost':this_host_name, 'targethost':opposite_host_name, 'sourcedir':this_host_dir, 'targetdir':opposite_host_dir, 'active':true, 'name':relationship_name}
-#        else:
-#            relationship_document = {'type':'relationship', 'sourcehost':opposite_host_name, 'targethost':this_host_name, 'sourcedir':opposite_host_dir, 'targetdir':this_host_dir, 'active':true, 'name':relationship_name}
-#
-#        # Construct new host document for the opposite end
-#        opposite_host_document = {'type':'host', 'ip4':opposite_host_ipv4, 'hostname':opposite_host_name, 'ip6':opposite_host_ipv6}
-#
-#        # Constrcut new host document for this host
-#        this_host_document = {'type':'host', 'ip4':this_host_ipv4, 'ip6':this_host_ipv6, 'hostname':this_host_name}
-#
-#    # prompt for Cloudant URL and login parameters to obtain a new auth string
-#    auth_not_set = 1
-#    while (auth_not_set):
-#        cloudant_user = raw_input("Enter Cloudant account name (DNS name before .cloudant.com) > ")
-#        cloudant_login = raw_input("Enter login username (usually the account name) > ")
-#        cloudant_pass = raw_input("Enter password > ")
-#        usrPass = userid + ":" + password
-#        cloudant_auth = base64.b64encode(usrPass)
-#        test_URI = "https://" + cloudant_user + ".cloudant.com"
-#        # Test auth by opening a cookie session, if not good try again
-#        if (test_auth(test_URI, cloudant_login, cloudant_pass)):
-#            auth_not_set = 0
-#
-#    # Print summary of changes to be written to database and config file to be created
-#    passdisplay = "*" * len(cloudant_pass)
-#    main_DB_URI = "https://" + cloudant_user + ".cloudant.com/rsynccheckpoint"
-#    print "This is the information which will be stored in the configuration file and associated cloudant database:"
-#    formatter = "%r : %r %r %r"
-#    print formatter % ("This Host and IP", this_host_name, this_host_ipv4, this_host_ipv6)
-#    print formatter % ("Opposite Host and IP", opposite_host_name, opposite_host_ipv4, opposite_host_ipv6)
-#    print "Data will be flowing thus:"
-#    formatter2 = "%r::%r -> %r::%r"
-#    print formatter2 % (relationship_document['sourcehost'], relationship_document['sourcedir'], relationship_document['targethost'], relationship_document['targetdir'])
-#    print "Rsync flags:" + rsync_flags
-#    if (len(rsync_excludes) > 0):
-#        print "Files/Dirs to exclude: " + rsync_excludes
-#    print formatter % ("Database", main_DB_URI,"","")
-#    print formatter % ("User",cloudant_user,"","")
-#    print formatter % ("Pass",passdisplay,"","")
-#    print "The configuration file 'dirscanconf.json' will be created in the current directory."
-#    print "Be sure to move it where it will be readable by the script when called by cron."
-#    while (approval not in ("y", "Y", "n", "N")):
-#        approval = raw_input("Is this all correct? (Y/N) > ")
-#    # If approved, execute writes and prompt to initiate first scan.
-#    if (approval in ("n","N")):
-#        print "Exiting..."
-#        sys.exit()
-#    else:
-#        config_file_dir = {'mainDB':main_DB_URI, 'bulkthreshold': 10000, 'auth':cloudant_auth, 'relationship':relationshipID, 'thishost':hostID, 'description':"This JSON document is used by dirscan.py for it's operations. CHANGE WITH CAUTION!"}
-#        # For future: Make threashold dependent upont number of total files during scan???
-#        try:
-#            config_file = open('dirscanconf.json', 'w')
-#        except IOError as e:
-#            print "I/O error({0}): {1}".format(e.errno, e.strerror)
-#        sys.exit(2)
-#        config_file.write(json.dumps(config_file_dir))
-#        config_file.close()
-#        if not (insert_single_doc_guid(this_host_document, main_DB_URI, cloudant_auth)):
-#            print "Failed to insert document into database, exiting."
-#            sys.exit()
-#        if not (insert_single_doc_guid(opposite_host_document, main_DB_URI, cloudant_auth)):
-#            print "Failed to insert document into database, exiting."
-#            sys.exit()
-#        if not (insert_single_doc_guid(relationship_document, main_DB_URI, cloudant_auth)):
-#            print "Failed to insert document into database, exiting."
-#            sys.exit()
-#
-## Create and delete a cookie session using the passed credentials to test login - DEPRECATED
-#def test_auth(baseURI, user, password):
-#    fullURI = baseURI + "/_session"
-#    fullheaders = {"Content-Type": "application/x-www-form-urlencoded"}
-#    response = requests.post(
-#        fullURI,
-#        headers = fullheaders,
-#        params = {'name': user, 'password': password}
-#    )
-#    if (response.status_code not in (200,201,202)):
-#        return(False)
-#    requests.delete(
-#        fullURI,
-#        headers = {"Content-Type": requests.cookies['AuthSession']}
-#    )
-#    return(True)
