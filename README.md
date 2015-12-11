@@ -13,8 +13,8 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 ## Files:
 * dirscan.py - script that runs on each local system, also contains procedures to setup first configuration file
 ** Utilizes the new Cloudant Python library.
-* synccheck.py - script to view the status of an rsync relationship, either during or after scans by dirscan.py
-* dirsync.js - Webpage that reads from Cloudant DB to obtain current sync state between the two hosts
+* synccheck.py - (placeholder) script to view the status of an rsync relationship, either during or after scans by dirscan.py
+* dirsync.js - (placeholder) Webpage script that reads from Cloudant DB to obtain current sync state between the two hosts
 
 
 
