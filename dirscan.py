@@ -387,7 +387,7 @@ def load_config(config_file):
     config['doc_threshold'] = config_json['threshold']
     
     # Connect to database
-    with cloudant(config['cloudant_user'], config['cloudant_auth']) as client:
+    with Cloudant(config['cloudant_user'],config['cloudant_auth'], account=config['cloudant_user']) as client:
         with CloudantDatabase(client, config['main_db_name']) as db:
     
             # Read in configuration of relationship from database
@@ -420,7 +420,7 @@ def directory_scan():
     # Init local variables
     this_scan = dict(
         database = '',
-        started = time.time(),
+        started = int(time.time()),
         ended = 0,
         source = False,
         type = 'scan',
@@ -492,7 +492,7 @@ def directory_scan():
     # Database creation function
     def new_scan_db():
         # Create a new database for this week
-        new_scan_db_name = join('scandb-',time.time())
+        new_scan_db_name = join('scandb-',int(time.time()))
         try:
             new_scan_db = client.create_database(new_scan_db_name)
         except Exception:
@@ -508,14 +508,15 @@ def directory_scan():
         
     # If other host has begun a scan: 
     if (other_host_scanned):
+        currenttime = int(time.time())
         # and selected database is NOT older than 30 days:
-        if (datetime.timedelta(time.time(),other_host_last_scan_DB[7:]) < config['db_rollover']):
+        if (datetime.timedelta(currenttime,other_host_last_scan_DB[7:]) < config['db_rollover']):
             
             # Use the same database as the other host for this_scan
             this_scan['database'] = other_host_last_scan_DB
             
         # Else if the other host has begun a scan, and the selected database is older than 30 days
-        if (datetime.timedelta(time.time(),other_host_last_scan_DB[7:]) >= config['db_rollover']):
+        if (datetime.timedelta(currenttime,other_host_last_scan_DB[7:]) >= config['db_rollover']):
             
             # Create a new database
             new_scan_db()
@@ -574,7 +575,7 @@ def directory_scan():
             # Obtain detailed stats on file from OS if possible
             try:
                 stat = os.stat(os.path.join(root,name))
-                filedict['datescanned'] = time.time()
+                filedict['datescanned'] = int(time.time())
                 filedict['size'] = stat['st_size']
                 filedict['permissionsUNIX'] = stat['st_mode']
                 filedict['datemodified'] = stat['st_mtime']
@@ -668,7 +669,7 @@ def directory_scan():
         ['errorcount',this_scan['errorcount']],
         ['filecount',this_scan['filecount']],
         ['directorysize',this_scan['directorysize']],
-        ['ended',time.time()],
+        ['ended',int(time.time())],
         ['success', this_scan['success']]
     ]
     for thisfield in updates:
@@ -795,12 +796,12 @@ def get_excludes(filename):
         else:
             config['rsync_excluded'].append(exclude)
     
-# TO-DO: Check for scan databases older than retention threshold and delete them
+# Check for scan databases older than retention threshold and delete them
 def purge_old_dbs(client):
     sys.exit("Not Implemented")
     # Get list of databases in the account
     dblist = client.all_dbs()
-    current_time = time.time()
+    current_time = int(time.time())
     # Permutate through all scandb database names and extract associated dates
     for db in dblist:
         if 'scandb-' not in db:

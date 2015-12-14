@@ -40,7 +40,7 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 ## Known Issues/Limitations:
 * Running more than one scanner concurrently on the same host can be a serious performance drain.  I recommend using a lock file wrapper on the cron task until one is implemented in-script.
 * Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them
-* An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated Cloudant docs from 'rsynccheckpoint' and per-diem database(s)
+* An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated docs (or entire DBs) from 'rsynccheckpoint' and 'scandb-xxx' database(s)
 * Input validation needed for numerous user-entry fields
 * Currently only 10 relationships are supported per account
 * IPv6 not supported yet
