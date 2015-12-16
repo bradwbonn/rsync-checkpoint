@@ -72,7 +72,7 @@ config = dict(
     # Time threshold to retain older scan databases for in seconds (default is 90 days)
     db_max_age = 7776000,
     # Setting to use for logging level.  Recommend no higher than INFO unless actually debugging
-    log_level = logging.DEBUG
+    log_level = logging.INFO
 )
 
 # Views in main database

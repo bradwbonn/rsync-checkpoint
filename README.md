@@ -38,10 +38,10 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * Create a cron task (or manually execute) the scan using `dirscan.py -c dirscansync.json` as a user which has full local read access to directory being scanned
 
 ## Known Issues/Limitations:
-* Running more than one scanner concurrently on the same host can be a serious performance drain.  I recommend using a lock file wrapper on the cron task until one is implemented in-script.
 * Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them
-* An existing relationship cannot be modified using the script, it would have to be deleted and re-created manually by deleting the associated docs (or entire DBs) from 'rsynccheckpoint' and 'scandb-xxx' database(s)
+* An existing relationship cannot be modified using the script. For now, delete the configuration file on each host and create new ones.
 * Input validation needed for numerous user-entry fields
 * Currently only 10 relationships are supported per account
 * IPv6 not supported yet
 * Non-unicode character path names are not supported at this time.
+* I recommend using a lock file wrapper on the cron task until one is implemented in-script to avoid concurrent local scans
