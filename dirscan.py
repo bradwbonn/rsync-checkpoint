@@ -13,10 +13,11 @@ from cloudant.account import Cloudant
 from cloudant.design_document import DesignDocument
 from cloudant.result import Result
 from cloudant.document import Document
-import cloudant
+from cloudant.views import View
+from cloudant import cloudant
 import getpass
-from os import walk
-from os import path
+import os
+import logging
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -30,9 +31,13 @@ config = dict(
     # Slot for user-specified config file to read
     passed_config_file = '',
     # Cloudant account name
+    cloudant_account = '',
+    # Cloudant login username
     cloudant_user = '',
-    # Slot for base64 auth string
-    cloudant_auth_string = '',
+    # Cloudant password
+    cloudant_auth = '',
+    # Slot for base64 auth string (Not currently used)
+    # cloudant_auth_string = '',
     # Help string printed if invalid options or '-h' used
     help_text = "Usage: dirscan.py [-c <configfile>] [-u] [-x <excludes_file>] [-v]",
     # Verbose setting (Default is off)
@@ -65,7 +70,9 @@ config = dict(
     # Time threshold to being writing to a new scan database in seconds (default is 30 days)
     db_rollover = 2592000,
     # Time threshold to retain older scan databases for in seconds (default is 90 days)
-    db_max_age = 7776000
+    db_max_age = 7776000,
+    # Setting to use for logging level.  Recommend no higher than INFO unless actually debugging
+    log_level = logging.INFO
 )
 
 # Views in main database
@@ -81,13 +88,13 @@ maindb_views = dict(
                  None],
     recent_scans = ['_design/scans',
                     'recentscans',
-                    'function (doc) {if (doc.type === "scan") {emit([doc.host, doc.success, doc.started], doc.database);}}',
-                    None]
+                    'function (doc) {if (doc.type === "scan") {emit([doc.hostID, doc.success, doc.started], doc.database);}}',
+                    "_count"]
 )
 
-# Views in each per-diem file dbs
+# Views in each per-diem file scan dbs
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
-filedb_views = dict(
+scandb_views = dict(
     file_types = [
         '_design/files',
         'typesscanned',
@@ -116,6 +123,13 @@ filedb_views = dict(
 
 # Main execution code
 def main(argv):
+    # Enable warning logs
+    try:
+        logging.basicConfig(filename='dirsync_errorlog.txt', level=config['log_level'])
+        logging.captureWarnings(True)
+    except Exception:
+        sys.exit("Can't open local log file.")
+    
     # Check options for validity, print help if user fat-fingered anything
     try:
         opts, args = getopt.getopt(argv,"hc:x:uv")
@@ -145,6 +159,8 @@ def main(argv):
     
     # If config file is specfied, read it in and execute scan
     if (len(config['passed_config_file']) > 0):
+        scanstarttime = datetime.datetime.utcnow().isoformat(' ')        
+        logging.info("Scan started at " + scanstarttime + " UTC")
         
         # Load configuration settings from file
         if (config['be_verbose']):
@@ -152,18 +168,22 @@ def main(argv):
         load_config(config['passed_config_file'])
         
         # Initiate scan
-        if (config['be_verbose']):
-            print config
+        logging.debug(json.dumps(config, sort_keys=True, indent=4, separators=(',', ': ')))
+
+        if config['be_verbose'] == True:
             print "Initiating scan now..."
         completion = directory_scan()
         
-        # If scan completed successfully, output when verbose
-        if (config['be_verbose']):
-            if (completion):
-                scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
+        # Log scan completion status
+        if (completion):
+            scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
+            logging.info("Scan successfully completed at: " + scanfinishtime + " UTC")
+            if config['be_verbose'] == True:
                 print "Scan successfully completed at " + scanfinishtime
-            else:
-                print "Scan aborted."
+        else:
+            if config['be_verbose'] == True:
+                print "Scan completed with errors at " + scanfinishtime
+            logging.warn("Scan completed with errors at: " + scanfinishtime + " UTC")
         
         # We're done here
         sys.exit()
@@ -182,64 +202,71 @@ def create_initial_config():
     # Initialize Cloudant client instance and obtain user credentials
     auth_not_set = True
     while (auth_not_set):
-        print "You will need a Cloudant account to use this script."
-        print "Go to www.cloudant.com to create one if you don't have it yet."
-        print "Enter Cloudant account name (DNS name before .cloudant.com):"
-        config['cloudant_user'] = raw_input("> ")
-        print "Enter login username (often the same as the account name):"
-        input_string = "["+ config['cloudant_user'] + "] > "
-        cloudant_login = raw_input(input_string)
-        if len(cloudant_login) == 0:
-            cloudant_login = config['cloudant_user']
-        cloudant_pass = getpass.getpass()
-        usrPass = cloudant_login + ":" + cloudant_pass
-        config['cloudant_auth_string'] = base64.b64encode(usrPass)
+        print " You will need a Cloudant account to use this script."
+        print " Go to www.cloudant.com to create one if you don't have it yet."
+        print " Enter Cloudant account name (DNS name before .cloudant.com):"
+        config['cloudant_account'] = raw_input("> ")
+        print " Enter login username (often the same as the account name):"
+        input_string = " ["+ config['cloudant_account'] + "] > "
+        config['cloudant_user'] = raw_input(input_string)
+        if len(config['cloudant_user']) == 0:
+            config['cloudant_user'] = config['cloudant_account']
+        config['cloudant_auth'] = getpass.getpass()
+#        usrPass = cloudant_login + ":" + cloudant_pass   # ultimately an ineffective security measure that only complicates things 
+#        config['cloudant_auth_string'] = base64.b64encode(usrPass)
         try:
-            client = Cloudant(cloudant_login, cloudant_pass, account=config['cloudant_user'])
+            client = Cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account'])
             client.connect()
             auth_not_set = False
         except Exception:
-            print "Sorry, try again."
+            print " Sorry, try again."
 
     # Create database object
     try:
         # Open existing database
         maindb = client[config['main_db_name']]
         if config['be_verbose'] == True:
-            print "Database found"
-        # To-do: validate views
+            print " Database found"
         
     except Exception:
         
         # Create database if it doesn't exist
         maindb = client.create_database(config['main_db_name'])
         if config['be_verbose'] == True:
-            print "Database created"
-            
+            print " Database created"
+    
+    # Give a delay to allow the database to respond        
     wait = True
     while (wait):
         if (maindb.exists()):
             wait = False
         else:
             if config['be_verbose'] == True:
-                print "Waiting for database to become available..."
+                print " Waiting for database to become available..."
             time.sleep(10)
             
     # Insert design documents for required indexes in main db
-    # Allow for a possible failure due to lag between database creation and usability
+    # Check each ddoc for existence before inserting
     for viewname in maindb_views:
         view = maindb_views[viewname]
-        try:
-            ddoc = DesignDocument(maindb, document_id=view[0])
-            ddoc.add_view(view[1], view[2], reduce_func=view[3])
-            ddoc.save()
-        except Exception:
-            sys.exit("Cannot insert design document: " + view[0])
+        tempdoc = Document(maindb, document_id=view[0])
+        if (tempdoc.exists()):
+            if config['be_verbose'] == True:
+                print " Design Document "+ view[0] +" found, skipping"
+            continue
+        else:
+            try:
+                ddoc = DesignDocument(maindb, document_id=view[0])
+                ddoc.add_view(view[1], view[2], reduce_func=view[3])
+                ddoc.save()
+            except Exception:
+                logging.fatal("Cannot insert design document: " + view[0])
+                sys.exit("Something went wrong. See log for errors")
     
     # Begin process of collecting data
     relationship_status = ''
     while (relationship_status not in ("y", "Y", "n", "N")):
-        relationship_status = raw_input("Is the relationship for this host already set up? (y/n) > ")
+        relationship_status = raw_input(" Is the relationship for this host already set up? (y/n) > ")
         
     if (relationship_status in ("y","Y")):
         # For cases where the relationship is already defined
@@ -265,7 +292,7 @@ def create_initial_config():
         # Choose the relationship automatically and run host setup
         create_host_entry(maindb, relationshipdocID)
         
-        print "Now run this setup on the other host."
+        print " Now run this setup on the other host."
     client.disconnect()
 
 # Take a given database and relationship document object and create a new host entry, plus write config file to local system
@@ -274,7 +301,7 @@ def create_host_entry(db, relationshipdocID):
     relationshipdoc = Document(db, relationshipdocID)
     relationshipdoc.fetch()
     
-    print "Editing relationship: " + relationshipdoc['name']
+    print " Editing relationship: " + relationshipdoc['name']
 
     # Get hosts by ID's from relationship, open docs and print names if they exist
     config_count = 0
@@ -348,8 +375,9 @@ def create_host_entry(db, relationshipdocID):
 
     # Populate config file's content for host
     config_file_content = dict(
-        auth = config['cloudant_auth_string'],
+        cloudant_auth = config['cloudant_auth'],
         cloudant_user = config['cloudant_user'],
+        cloudant_account = config['cloudant_account'],
         relationship = relationshipdoc['_id'],
         host_id = new_host_ID,
         threshold = config['doc_threshold']
@@ -368,8 +396,8 @@ def write_config_file(config_dict):
         sys.exit(2)
     json.dump(config_dict, data)
     data.close()
-    print config['default_config_filename'] +" written."
-    print "This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
+    print " " + config['default_config_filename'] +" written."
+    print " This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
 
 # Load configuration from file and database into configuration dictionary
 def load_config(config_file):
@@ -380,30 +408,31 @@ def load_config(config_file):
         sys.exit(2)
     config_json = json.load(data)
     data.close()
-    config['cloudant_auth'] = config_json['auth']
+    config['cloudant_auth'] = config_json['cloudant_auth']
     config['cloudant_user'] = config_json['cloudant_user']
+    config['cloudant_account'] = config_json['cloudant_account']
     config['relationship'] = config_json['relationship']
     config['host_id'] = config_json['host_id']
     config['doc_threshold'] = config_json['threshold']
     
     # Connect to database
-    with Cloudant(config['cloudant_user'],config['cloudant_auth'], account=config['cloudant_user']) as client:
-        with CloudantDatabase(client, config['main_db_name']) as db:
-    
-            # Read in configuration of relationship from database
-            with Document(db, config['relationship']) as relationshipdoc:
-                config['rsync_flags'] = relationshipdoc['rsyncflags']
-                config['rsync_excluded'] = relationshipdoc['excludedfiles']
-                config['rsync_source'] = relationshipdoc['sourcehost']
-                config['rsync_target'] = relationshipdoc['targethost']
-                config['rsync_source_dir'] = relationshipdoc['sourcedir']
-                config['rsync_target_dir'] = relationshipdoc['targetdir']
-            
-            # Get hosts' IP addresses
-            with Document(db, config['rsync_source']) as sourcedoc:
-                config['source_ip'] = sourcedoc['ip4']
-            with Document(db, config['rsync_target']) as targetdoc:
-                config['target_ip'] = targetdoc['ip4']
+    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
+        db = client[config['main_db_name']]
+        #db = CloudantDatabase(client, config['main_db_name'])
+        # Read in configuration of relationship from database
+        with Document(db, config['relationship']) as relationshipdoc:
+            config['rsync_flags'] = relationshipdoc['rsyncflags']
+            config['rsync_excluded'] = relationshipdoc['excludedfiles']
+            config['rsync_source'] = relationshipdoc['sourcehost']
+            config['rsync_target'] = relationshipdoc['targethost']
+            config['rsync_source_dir'] = relationshipdoc['sourcedir']
+            config['rsync_target_dir'] = relationshipdoc['targetdir']
+        
+        # Get hosts' IP addresses
+        with Document(db, config['rsync_source']) as sourcedoc:
+            config['source_ip'] = sourcedoc['ip4']
+        with Document(db, config['rsync_target']) as targetdoc:
+            config['target_ip'] = targetdoc['ip4']
             
     # Set flag for whether we're scanning a source or target
     if (config['host_id'] == config['rsync_source']):
@@ -413,9 +442,8 @@ def load_config(config_file):
         config['is_source'] = False
         config['other_host_id'] = config['rsync_source']
 
-# TO-DO: filesystem scan function 
+# filesystem scan function 
 def directory_scan():
-    sys.exit("Not implemented")
     
     # Init local variables
     this_scan = dict(
@@ -444,42 +472,52 @@ def directory_scan():
         
     # Initialize Cloudant connection
     try:
-        client = Cloudant(config['cloudant_user'], config['cloudant_auth'])
+        client = Cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account'])
         client.connect()
     except Exception:
-        sys.exit("FAIL: Unable to open connection to Cloudant")
+        logging.fatal("Unable to connect to Cloudant")
+        sys.exit("Something went wrong. See log for errors")
 
     # Open main database
     try:
         maindb = client[config['main_db_name']]
     except Exception:
-        sys.exit("FAIL: Main database can't be found")
+        logging.fatal("Main database cannot be found in Cloudant account")
+        sys.exit("Something went wrong. See log for errors")
 
     # Get this host's last successful scan info (if it exists)
-    thisview = maindb_views['recentscans']
-    beginhere = [config['host_id'],True,'']
-    endhere = [config['host_id'],True,{}]
-    with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
-        if len(raw_result) > 0:
-            this_host_scanned = True
-            this_scan['firstscan'] = False
-            this_scan['previousscanID'] = raw_result['_id']
-            last_scan_DB = raw_result['value']
-            last_scan_complete = raw_result['key'][2]
-        else:
-            this_host_scanned = False
+    thisview = maindb_views['recent_scans']
+    beginhere = [config['host_id'],True,{}]
+    endhere = [config['host_id'],True,0]
+    logging.debug("query: "+ thisview[0] + thisview[1] + "?startkey=" + str(beginhere) + "&endkey=" + str(endhere) + "&descending=true&reduce=false&limit=1")
+    
+    raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
+    if len(raw_result) == 1:
+        logging.debug("Previous scan found for this host: "+ raw_result[0]['id'])
+        this_host_scanned = True
+        this_scan['firstscan'] = False
+        this_scan['previousscanID'] = raw_result[0]['id']
+        last_scan_DB = raw_result[0]['value']
+        last_scan_complete = raw_result[0]['key'][2]
+    else:
+        logging.debug("Previous scan NOT FOUND for this host.")
+        this_host_scanned = False
     
     # Get the other host's last scan info (if it exists, even if it's running)
-    beginhere = [config['other_host_id'],False,'']
-    endhere = [config['other_host_id'],True,{}]
-    with maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True) as raw_result:
-        if len(raw_result) > 0:
-            other_host_scanned = True
-            other_host_last_scan = raw_result['_id']
-            other_host_last_scan_DB = raw_result['value']
-            other_host_last_scan_complete = raw_result['key'][2]
-        else:
-            other_host_scanned = False
+    beginhere = [config['other_host_id'],False,{}]
+    endhere = [config['other_host_id'],True,0]
+    logging.debug("query: "+ thisview[0] + thisview[1] + "?startkey=" + str(beginhere) + "&endkey=" + str(endhere) + "&descending=true&reduce=false&limit=1")
+    
+    raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
+    if len(raw_result) == 1:
+        logging.debug("Previous scan found for opposite host: " + raw_result[0]['id'])
+        other_host_scanned = True
+        other_host_last_scan = raw_result[0]['id']
+        other_host_last_scan_DB = raw_result[0]['value']
+        other_host_last_scan_complete = raw_result[0]['key'][2]
+    else:
+        logging.debug("Previous scan NOT found for opposite host.")
+        other_host_scanned = False
         
     # Determine current scan database basis
     # General idea is to use the same database as the other host is currently using, provided that the database isn't older than one month.
@@ -492,60 +530,95 @@ def directory_scan():
     # Database creation function
     def new_scan_db():
         # Create a new database for this week
-        new_scan_db_name = join('scandb-',int(time.time()))
+        new_scan_db_name = 'scandb-' + str(int(time.time()))
+        logging.info("Creating a new database for this scan: " + new_scan_db_name)
         try:
             new_scan_db = client.create_database(new_scan_db_name)
         except Exception:
-            sys.exit("FATAL: Cannot create new temporal scan database")
+            logging.fatal("Cannot create scan database")
+            sys.exit("Something has gone wrong. See log for details")
             
-        # Populate filedb_views
-        for thisview in scandb_views:
-            with DesignDocument(db, document_id=view[0]) as ddoc:
-                ddoc.add_view(view[1], view[2], reduce_func=view[3])
+        # Wait for new scandb to come online
+        wait = True
+        while (wait):
+            if (new_scan_db.exists()):
+                wait = False
+            else:
+                if config['be_verbose'] == True:
+                    print "Waiting for database to become available..."
+                time.sleep(10)
+        
+        # Populate scandb_views
+        for viewname in scandb_views:
+            thisview = scandb_views[viewname]
+            ddoc = DesignDocument(new_scan_db, document_id=thisview[0])
+            ddoc.add_view(thisview[1], thisview[2], reduce_func=thisview[3])
+            try:
+                ddoc.save()
+            except Exception:
+                logging.fatal("Cannot insert design document " + thisview[0] + " into " + new_scan_db_name)
+                sys.exit("Something has gone wrong. See log for details")
                 
         # Set database name for this_scan
         this_scan['database'] = new_scan_db_name
         
+    currenttime = int(time.time())
     # If other host has begun a scan: 
     if (other_host_scanned):
-        currenttime = int(time.time())
+
+        logging.debug("Other host was previously scanned")
         # and selected database is NOT older than 30 days:
-        if (datetime.timedelta(currenttime,other_host_last_scan_DB[7:]) < config['db_rollover']):
+        if ((currenttime - int(other_host_last_scan_DB[7:])) < config['db_rollover']):
             
             # Use the same database as the other host for this_scan
+            logging.debug("Using same DB as other host")
             this_scan['database'] = other_host_last_scan_DB
             
         # Else if the other host has begun a scan, and the selected database is older than 30 days
-        if (datetime.timedelta(currenttime,other_host_last_scan_DB[7:]) >= config['db_rollover']):
-            
+        if ((currenttime - int(other_host_last_scan_DB[7:])) >= config['db_rollover']):
+            logging.debug("Previous scan DB too old.")
             # Create a new database
             new_scan_db()
             
+        # If the other host is using an older DB, set the flag and open it
+        if (this_scan['database'] != other_host_last_scan_DB):
+            logging.debug("Databases are skewed, setting older_scandb value")
+            db_skew = True
+            older_scandb = client[other_host_last_scan_DB]
+        else:
+            db_skew = False
+            
     # Else If there is no prior scan for either host
     elif (not this_host_scanned and not other_host_scanned):
+        logging.debug("Neither host has been scanned previously")
         # create a new database
         new_scan_db()
+    
+    # Else if there is a local scan, but not a remote scan
+    elif (this_host_scanned and not other_host_scanned):
+        logging.debug("This host has been scanned, but the other hasn't yet.")
+        logging.debug("DB time: " + last_scan_DB[7:] + " Current time: " + str(currenttime))
+        # If selected DB is older than 30 days
+        if (currenttime - int(last_scan_DB[7:]) >= config['db_rollover']):
+            logging.debug("Previous scan DB too old.")
+            new_scan_db()
+        else:
+            this_scan['database'] = last_scan_DB
         
     else:
         # Something has gone horribly wrong
-        sys.exit("FATAL: Database selection logic unresolvable")
+        logging.fatal("Database selection logic unresolvable")
+        sys.exit("Something has gone wrong. See log for details.")
 
-
+    logging.info("Scanning using database: " + this_scan['database'])
     # Create new scan document from this_scan dictionary and keep open for duration of scan
     scandoc = maindb.create_document(this_scan)
     
     # Open the scan database
     scandb = client[this_scan['database']]
-    
-    # If the other host is using an older DB, set the flag and open it
-    if (this_scan['database'] != other_host_last_scan_DB):
-        db_skew = True
-        older_scandb = client[other_host_last_scan_DB]
-    else:
-        db_skew = False
 
     # Total files scanned counter
-    filecount = 0
+    this_scan['filecount'] = 0
     
     # Dictionary of document dictionaries scanned
     file_doc_batch = []
@@ -562,37 +635,46 @@ def directory_scan():
         
         for name in files:
             # Iterate counter for scan
-            filecount = filecount + 1
+            this_scan['filecount'] = this_scan['filecount'] + 1
+            filedict = dict()
             
             # Obtain base file information and store into dict
+            # Set all defaults
             filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), this_scan['started'])
             filedict['name'] = name
             filedict['scanID'] = scandoc['_id']
             filedict['host'] = config['host_id']
             filedict['relationship'] = config['relationship']
             filedict['path'] = root
+            filedict['datescanned'] = 0
+            filedict['size'] = 0
+            filedict['permissionsUNIX'] = 0
+            filedict['datemodified'] = 0
+            filedict['owner'] = 0
+            filedict['group'] = 0
+            filedict['goodscan'] = False
+            filedict['source'] = True
             
             # Obtain detailed stats on file from OS if possible
             try:
                 stat = os.stat(os.path.join(root,name))
                 filedict['datescanned'] = int(time.time())
-                filedict['size'] = stat['st_size']
-                filedict['permissionsUNIX'] = stat['st_mode']
-                filedict['datemodified'] = stat['st_mtime']
-                filedict['owner'] = stat['st_uid']
-                filedict['group'] = stat['st_gid']
+                filedict['size'] = stat.st_size
+                filedict['permissionsUNIX'] = stat.st_mode
+                filedict['datemodified'] = stat.st_mtime
+                filedict['owner'] = stat.st_uid
+                filedict['group'] = stat.st_gid
                 filedict['goodscan'] = True
                 this_scan['directorysize'] = this_scan['directorysize'] + filedict['size']
                 if (config['ultra_scan'] == True):
                     filedict['checksum'] = compute_file_hash(os.path.join(root,name))
-            except:
+            except os.stat_result:
                 # permissions problem most likely, store as bad scan of file and iterate errors
-                filedict['goodscan'] = False
                 this_scan['errorcount'] = this_scan['errorcount'] + 1
+                logging.warn("File " + os.path.join(root,name) + " unreadable")
                 
             if (config['is_source']):
                 # We're done scanning this file.  Put it into the array.
-                filedict['source'] = True
                 file_doc_batch.append(filedict)
 
             else:
@@ -600,11 +682,11 @@ def directory_scan():
                 filedict['source'] = False
                 
                 # Check for source file scanned in database 
-                source_id_hash = hashlib.sha1(join(config['other_host_id'],os.path.join(root,name))).hexdigest()
+                source_id_hash = hashlib.sha1(config['other_host_id'] + os.path.join(root,name)).hexdigest()
                 if db_skew:
-                    source_file = older_scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
+                    source_file = older_scandb.all_docs(descending=True, startkey=source_id_hash, endkey=source_id_hash + str(99999999999999999999), limit=1)
                 else:
-                    source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=join(source_id_hash, 99999999999999999999), limit=1)
+                    source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=source_id_hash + str(99999999999999999999), limit=1)
                 
                 # If file has been scanned:
                 if len(source_file) > 0:
@@ -618,7 +700,7 @@ def directory_scan():
                         filedict['orphaned'] = 'no'
 
                         # But to determine if it's stale, check the scanned file's modified date against the most recent source version.
-                        thisview = filedb_views['sourcefiles']
+                        thisview = scandb_views['sourcefiles']
                         if db_skew:
                             result = older_scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
                         else:
@@ -647,7 +729,7 @@ def directory_scan():
                 file_doc_batch.append(filedict)
                                             
         # If we're at _bulk_docs threshold
-        if ((filecount > 1) and (int(filecount) / int(config['threshold']) == int(filecount) / float('threshold'))):
+        if ((this_scan['filecount'] > 1) and (int(this_scan['filecount']) / int(config['doc_threshold']) == int(this_scan['filecount']) / float(config['doc_threshold']))):
             # write batch to database
             scandb.bulk_docs(file_doc_batch)
             # flush batch array
@@ -674,19 +756,32 @@ def directory_scan():
     ]
     for thisfield in updates:
         scandoc[thisfield[0]] = thisfield[1]
+        
     scandoc.save()
+    logging.info("Scan stats: ")
+    logging.info(json.dumps(updates, sort_keys=True, indent=4, separators=(',', ': ')))
     
     # Now that this scan is complete, wipe out any expired databases
     purge_old_dbs(client)
     
     # Close database out
     client.disconnect()
+    
+    return(this_scan['success'])
 
 # Return the unique ID for a file based upon hash and last scan timestamp
 # Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the most recent UTC
 def get_file_id(host_id, full_path, timestamp):
-    filehash = hashlib.sha1(join(host_id,full_path)).hexdigest()
-    return (join(filehash,timestamp))
+    try:
+        f1 = full_path.decode('utf-8', errors='replace')
+        filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest()
+    except UnicodeDecodeError:
+        logging.warn("Path Decode error: " + full_path)
+        filehash = hashlib.sha1(host_id).hexdigest()        
+    except UnicodeEncodeError:
+        logging.warn("Path Encode error: " + full_path)
+        filehash = hashlib.sha1(host_id).hexdigest()
+    return (filehash + str(timestamp))
 
 # Insanely-slow but ultra-effective scanner process that computes an md5 hash of every file it encounters
 # Currently this option is hard-coded to be disabled.
@@ -756,32 +851,31 @@ def create_new_relationship(db):
     
 # TO-DO: Find a host by name, using search index
 def find_host(host_name):
-    sys.exit("Not implemented")
+    pass
 
 # Find a relationship by listing all known relationships and letting the user choose the appropriate one
 def list_relationships(db):
     print "| Which relationship is this host part of?"
     print "| ID | Relationship                       |"
-    
-    # Open view
-    with DesignDocument(db, maindb_views['all_relations'][0]) as ddoc:
-        with View(ddoc, maindb_views['all_relations'][1]) as view:
-            
-            # Iterate through relationships, storing and printing a key for each
-            relationship_key = 0
-            relationship_set = []
-            for row in view(include_docs=False, limit=10)['rows']:
-                relationship_key = relationship_key + 1
-                print "| " + relationship_key + " | " + row['key'][0]
-                relationship_set[relationship_key] = row['_id']
-                
-            # Ask user to select desired relationship from list
-            relationship_selected = -1
-            while (relationship_selected not in relationship_set):
-                relationship_selected = raw_input("| > ")
+
+    # Open view (no context handlers supported currently)
+    ddoc = DesignDocument(db, document_id=maindb_views['all_relations'][0])
+    view = View(ddoc, maindb_views['all_relations'][1])
         
+    # Iterate through relationships, storing and printing a key for each
+    relationship_key = 0
+    relationship_set = ['']
+    for row in view(include_docs=False, limit=10)['rows']:
+        relationship_key = relationship_key + 1
+        print "|  " + str(relationship_key) + " | " + row['key']
+        relationship_set.append(row['id'])
+        
+    # Ask user to select desired relationship from list
+    # TO-DO: Input validation
+    relationship_selected = raw_input(" > ")
+
     # Pass back the appropriate relationship document _id
-    return relationship_set[relationship_selected]
+    return relationship_set[int(relationship_selected)]
 
 # Read in the excludes file passed at startup and store to the config array
 def get_excludes(filename):
@@ -792,27 +886,25 @@ def get_excludes(filename):
         sys.exit(2)
     for exclude in data:
         if exclude.isspace():
-            next()
+            continue
         else:
             config['rsync_excluded'].append(exclude)
     
 # Check for scan databases older than retention threshold and delete them
+# TO-DO: Delete scan dbs without any successful scan documents associated with them and are beyond a certain threshold in number
 def purge_old_dbs(client):
-    sys.exit("Not Implemented")
-    # Get list of databases in the account
     dblist = client.all_dbs()
     current_time = int(time.time())
-    # Permutate through all scandb database names and extract associated dates
     for db in dblist:
         if 'scandb-' not in db:
-            next()
+            continue
         else:
             # If the extracted timestamp is older than the threshold
-            if (datetime.timedelta(current_time,db[7:]) > config['db_max_age']):
-                
+            if ((current_time - int(db[7:])) > config['db_max_age']):
+                logging.info("Deleting out-dated database: " + db)
                 # execute a database delete command
-                with Database(client,db) as doomed_db:
-                    doomed_db.delete()
+                doomed_db = Database(client,db)
+                doomed_db.delete()
 
 
 if __name__ == "__main__":

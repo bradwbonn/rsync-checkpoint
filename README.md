@@ -10,18 +10,19 @@ The python scripts all utilize the cloudant-python beta (2.0.0a4) library, avail
 	pip install --pre cloudant
 	
 The deprecated (0.5.10) cloudant python library will not work with these scripts.
+
 ## Files:
-* dirscan.py - script that runs on each local system, also contains procedures to setup first configuration file
+* dirscan.py (in alpha now) - script that runs on each local system, also contains procedures to setup first configuration file
 ** Utilizes the new Cloudant Python library.
-* synccheck.py - (placeholder) script to view the status of an rsync relationship, either during or after scans by dirscan.py
-* dirsync.js - (placeholder) Webpage script that reads from Cloudant DB to obtain current sync state between the two hosts
+* synccheck.py (placeholder) - script to view the status of an rsync relationship, either during or after scans by dirscan.py
+* dirsync.js (placeholder) - Webpage script that reads from Cloudant DB to obtain current sync state between the two hosts
 
 
 
-#### Example configuration file JSON
+#### Example local configuration file (JSON format)
 
 	{
-		‘auth’: <base64 Auth String>,
+		‘cloudant_auth’: <Cloudant password>,
 		‘cloudant_user': <Cloudant account name>,
 		‘relationship': <ID of host relationship>,
 		‘host_id’: <ID of host this file is for>,
@@ -44,3 +45,4 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * Input validation needed for numerous user-entry fields
 * Currently only 10 relationships are supported per account
 * IPv6 not supported yet
+* Non-unicode character path names are not supported at this time.
