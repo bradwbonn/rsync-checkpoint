@@ -7,8 +7,8 @@ import getopt
 import base64
 import sys
 import hashlib
-import datetime
 import time
+import datetime
 from cloudant.account import Cloudant
 from cloudant.design_document import DesignDocument
 from cloudant.result import Result
@@ -72,7 +72,7 @@ config = dict(
     # Time threshold to retain older scan databases for in seconds (default is 90 days)
     db_max_age = 7776000,
     # Setting to use for logging level.  Recommend no higher than INFO unless actually debugging
-    log_level = logging.INFO
+    log_level = logging.DEBUG
 )
 
 # Views in main database
@@ -173,10 +173,9 @@ def main(argv):
         if config['be_verbose'] == True:
             print "Initiating scan now..."
         completion = directory_scan()
-        
+        scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
         # Log scan completion status
         if (completion):
-            scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
             logging.info("Scan successfully completed at: " + scanfinishtime + " UTC")
             if config['be_verbose'] == True:
                 print "Scan successfully completed at " + scanfinishtime
@@ -212,8 +211,7 @@ def create_initial_config():
         if len(config['cloudant_user']) == 0:
             config['cloudant_user'] = config['cloudant_account']
         config['cloudant_auth'] = getpass.getpass()
-#        usrPass = cloudant_login + ":" + cloudant_pass   # ultimately an ineffective security measure that only complicates things 
-#        config['cloudant_auth_string'] = base64.b64encode(usrPass)
+
         try:
             client = Cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account'])
             client.connect()
@@ -247,21 +245,7 @@ def create_initial_config():
             
     # Insert design documents for required indexes in main db
     # Check each ddoc for existence before inserting
-    for viewname in maindb_views:
-        view = maindb_views[viewname]
-        tempdoc = Document(maindb, document_id=view[0])
-        if (tempdoc.exists()):
-            if config['be_verbose'] == True:
-                print " Design Document "+ view[0] +" found, skipping"
-            continue
-        else:
-            try:
-                ddoc = DesignDocument(maindb, document_id=view[0])
-                ddoc.add_view(view[1], view[2], reduce_func=view[3])
-                ddoc.save()
-            except Exception:
-                logging.fatal("Cannot insert design document: " + view[0])
-                sys.exit("Something went wrong. See log for errors")
+    populate_views(maindb, maindb_views)
     
     # Begin process of collecting data
     relationship_status = ''
@@ -338,7 +322,9 @@ def create_host_entry(db, relationshipdocID):
     this_host_IP4 = raw_input("Enter IPv4 address of this host: ")
     this_host_IP6 = raw_input("Enter IPv6 address of this host (Optional): ")
     this_host_directory = raw_input("Enter this host's sync root directory (full path required): ")
-    
+    # Add a trailing slash if one is not present in the user input for path consistency
+    if (this_host_directory[len(this_host_directory)-1] != "/"):
+        this_host_directory = this_host_directory + "/"
     # TO-DO: Validate path exists
     # validate_path(this_host_directory)
     
@@ -477,55 +463,13 @@ def directory_scan():
     except Exception:
         logging.fatal("Unable to connect to Cloudant")
         sys.exit("Something went wrong. See log for errors")
-
+        
     # Open main database
     try:
         maindb = client[config['main_db_name']]
     except Exception:
         logging.fatal("Main database cannot be found in Cloudant account")
         sys.exit("Something went wrong. See log for errors")
-
-    # Get this host's last successful scan info (if it exists)
-    thisview = maindb_views['recent_scans']
-    beginhere = [config['host_id'],True,{}]
-    endhere = [config['host_id'],True,0]
-    logging.debug("query: "+ thisview[0] + thisview[1] + "?startkey=" + str(beginhere) + "&endkey=" + str(endhere) + "&descending=true&reduce=false&limit=1")
-    
-    raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
-    if len(raw_result) == 1:
-        logging.debug("Previous scan found for this host: "+ raw_result[0]['id'])
-        this_host_scanned = True
-        this_scan['firstscan'] = False
-        this_scan['previousscanID'] = raw_result[0]['id']
-        last_scan_DB = raw_result[0]['value']
-        last_scan_complete = raw_result[0]['key'][2]
-    else:
-        logging.debug("Previous scan NOT FOUND for this host.")
-        this_host_scanned = False
-    
-    # Get the other host's last scan info (if it exists, even if it's running)
-    beginhere = [config['other_host_id'],False,{}]
-    endhere = [config['other_host_id'],True,0]
-    logging.debug("query: "+ thisview[0] + thisview[1] + "?startkey=" + str(beginhere) + "&endkey=" + str(endhere) + "&descending=true&reduce=false&limit=1")
-    
-    raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
-    if len(raw_result) == 1:
-        logging.debug("Previous scan found for opposite host: " + raw_result[0]['id'])
-        other_host_scanned = True
-        other_host_last_scan = raw_result[0]['id']
-        other_host_last_scan_DB = raw_result[0]['value']
-        other_host_last_scan_complete = raw_result[0]['key'][2]
-    else:
-        logging.debug("Previous scan NOT found for opposite host.")
-        other_host_scanned = False
-        
-    # Determine current scan database basis
-    # General idea is to use the same database as the other host is currently using, provided that the database isn't older than one month.
-    # If the current scanning host sees that the database is too old, it'll create a new one and start inserting documents into it.  Until the
-    # other host runs another scan and sees that there's a newer DB in use by the other host, we read from the older database during the check
-    # for the state of a target file when needed.
-
-    # Database naming format: join('scandb-',<UTC Timestamp>)
         
     # Database creation function
     def new_scan_db():
@@ -548,81 +492,124 @@ def directory_scan():
                     print "Waiting for database to become available..."
                 time.sleep(10)
         
-        # Populate scandb_views
-        for viewname in scandb_views:
-            thisview = scandb_views[viewname]
-            ddoc = DesignDocument(new_scan_db, document_id=thisview[0])
-            ddoc.add_view(thisview[1], thisview[2], reduce_func=thisview[3])
-            try:
-                ddoc.save()
-            except Exception:
-                logging.fatal("Cannot insert design document " + thisview[0] + " into " + new_scan_db_name)
-                sys.exit("Something has gone wrong. See log for details")
+        # Populate scandb views
+        populate_views(new_scan_db, scandb_views)
                 
         # Set database name for this_scan
         this_scan['database'] = new_scan_db_name
         
-    currenttime = int(time.time())
-    # If other host has begun a scan: 
-    if (other_host_scanned):
-
-        logging.debug("Other host was previously scanned")
-        # and selected database is NOT older than 30 days:
-        if ((currenttime - int(other_host_last_scan_DB[7:])) < config['db_rollover']):
-            
-            # Use the same database as the other host for this_scan
-            logging.debug("Using same DB as other host")
-            this_scan['database'] = other_host_last_scan_DB
-            
-        # Else if the other host has begun a scan, and the selected database is older than 30 days
-        if ((currenttime - int(other_host_last_scan_DB[7:])) >= config['db_rollover']):
-            logging.debug("Previous scan DB too old.")
-            # Create a new database
-            new_scan_db()
-            
-        # If the other host is using an older DB, set the flag and open it
-        if (this_scan['database'] != other_host_last_scan_DB):
-            logging.debug("Databases are skewed, setting older_scandb value")
-            db_skew = True
-            older_scandb = client[other_host_last_scan_DB]
+    # Scan database selection function
+    def scan_db_selection(maindb):
+        db_logic = dict()
+        # Get this host's last successful scan info (if it exists)
+        thisview = maindb_views['recent_scans']
+        beginhere = [config['host_id'],True,{}]
+        endhere = [config['host_id'],True,0]
+        raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
+        if len(raw_result) == 1:
+            logging.debug("Previous scan found for this host: "+ raw_result[0]['id'])
+            db_logic['this_host_scanned'] = True
+            this_scan['firstscan'] = False
+            this_scan['previousscanID'] = raw_result[0]['id']
+            db_logic['last_scan_DB'] = raw_result[0]['value']
+            db_logic['last_scan_complete'] = raw_result[0]['key'][2]
         else:
-            db_skew = False
-            
-    # Else If there is no prior scan for either host
-    elif (not this_host_scanned and not other_host_scanned):
-        logging.debug("Neither host has been scanned previously")
-        # create a new database
-        new_scan_db()
-    
-    # Else if there is a local scan, but not a remote scan
-    elif (this_host_scanned and not other_host_scanned):
-        logging.debug("This host has been scanned, but the other hasn't yet.")
-        logging.debug("DB time: " + last_scan_DB[7:] + " Current time: " + str(currenttime))
-        # If selected DB is older than 30 days
-        if (currenttime - int(last_scan_DB[7:]) >= config['db_rollover']):
-            logging.debug("Previous scan DB too old.")
-            new_scan_db()
-        else:
-            this_scan['database'] = last_scan_DB
+            logging.debug("Previous scan NOT FOUND for this host.")
+            db_logic['this_host_scanned'] = False
         
-    else:
-        # Something has gone horribly wrong
-        logging.fatal("Database selection logic unresolvable")
-        sys.exit("Something has gone wrong. See log for details.")
-
-    logging.info("Scanning using database: " + this_scan['database'])
+        # Get the other host's last scan info (if it exists, even if it's running)
+        beginhere = [config['other_host_id'],True,{}]
+        endhere = [config['other_host_id'],False,0] 
+        raw_result = maindb.get_view_raw_result(thisview[0], thisview[1], startkey=beginhere , endkey=endhere , limit=1, reduce=False, descending=True)['rows']
+        if len(raw_result) == 1:
+            logging.debug("Previous scan found for opposite host: " + raw_result[0]['id'])
+            db_logic['other_host_scanned'] = True
+            db_logic['other_host_last_scan'] = raw_result[0]['id']
+            db_logic['other_host_last_scan_DB'] = raw_result[0]['value']
+            db_logic['other_host_last_scan_complete'] = raw_result[0]['key'][2]
+        else:
+            logging.debug("Previous scan NOT found for opposite host.")
+            db_logic['other_host_scanned'] = False
+            
+        # Determine current scan database basis
+        # General idea is to use the same database as the other host is currently using, provided that the database isn't older than one month.
+        # If the current scanning host sees that the database is too old, it'll create a new one and start inserting documents into it.  Until the
+        # other host runs another scan and sees that there's a newer DB in use by the other host, we read from the older database during the check
+        # for the state of a target file when needed.
+    
+        # Database naming format: join('scandb-',<UTC Timestamp>)
+        currenttime = int(time.time())
+        # If other host has begun a scan: 
+        if (db_logic['other_host_scanned']):
+    
+            logging.debug("Other host was previously scanned")
+            # and selected database is NOT older than 30 days:
+            if ((currenttime - int(db_logic['other_host_last_scan_DB'][7:])) < config['db_rollover']):
+                
+                # Use the same database as the other host for this_scan
+                logging.debug("Using same DB as other host")
+                this_scan['database'] = db_logic['other_host_last_scan_DB']
+                
+            # Else if the other host has begun a scan, and the selected database is older than 30 days
+            if ((currenttime - int(db_logic['other_host_last_scan_DB'][7:])) >= config['db_rollover']):
+                logging.debug("Previous scan DB too old.")
+                # Create a new database
+                new_scan_db()
+                
+            # If the other host is using an older DB, set the flag and open it
+            if (this_scan['database'] != db_logic['other_host_last_scan_DB']):
+                logging.debug("Databases are skewed, setting older_scandb value")
+                db_logic['db_skew'] = True
+                db_logic['older_scandb'] = client[db_logic['other_host_last_scan_DB']]
+            else:
+                db_logic['db_skew'] = False
+                
+        # Else If there is no prior scan for either host
+        elif (not this_host_scanned and not other_host_scanned):
+            logging.debug("Neither host has been scanned previously")
+            # create a new database
+            new_scan_db()
+        
+        # Else if there is a local scan, but not a remote scan
+        elif (this_host_scanned and not other_host_scanned):
+            logging.debug("This host has been scanned, but the other hasn't yet.")
+            logging.debug("DB time: " + db_logic['last_scan_DB'][7:] + " Current time: " + str(currenttime))
+            # If selected DB is older than 30 days
+            if (currenttime - int(db_logic['last_scan_DB'][7:]) >= config['db_rollover']):
+                logging.debug("Previous scan DB too old.")
+                new_scan_db()
+            else:
+                this_scan['database'] = db_logic['last_scan_DB']
+            
+        else:
+            # Something has gone horribly wrong
+            logging.fatal("Database selection logic unresolvable")
+            sys.exit("Something has gone wrong. See log for details.")
+        
+        # Return the relevant data for the database with the other host
+        return(db_logic)
+        
+    # Run the database selection logic to determine the scan database to use and create it if needed
+    db_logic = scan_db_selection(maindb)
+        
+    # Open the selected scan database. If it was somehow accidentally deleted, create a new one of the same name
+    try:
+        scandb = client[this_scan['database']]
+    except:
+        logging.error("Scan db " + this_scan['database'] + " can't be found in Cloudant.")
+        new_scan_db()
+        scandb = client[this_scan['database']]
+        
     # Create new scan document from this_scan dictionary and keep open for duration of scan
     scandoc = maindb.create_document(this_scan)
-    
-    # Open the scan database
-    scandb = client[this_scan['database']]
-
+    logging.info("Scanning using database: " + this_scan['database'])
+        
     # Total files scanned counter
     this_scan['filecount'] = 0
-    
+        
     # Dictionary of document dictionaries scanned
     file_doc_batch = []
-    
+        
     if config['be_verbose'] == True:
         print "Beginning filesystem scan"
         
@@ -640,7 +627,7 @@ def directory_scan():
             
             # Obtain base file information and store into dict
             # Set all defaults
-            filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), this_scan['started'])
+            filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), this_scan['directory'], this_scan['started'])
             filedict['name'] = name
             filedict['scanID'] = scandoc['_id']
             filedict['host'] = config['host_id']
@@ -654,6 +641,7 @@ def directory_scan():
             filedict['group'] = 0
             filedict['goodscan'] = False
             filedict['source'] = True
+            filedict['type'] = "file"
             
             # Obtain detailed stats on file from OS if possible
             try:
@@ -668,11 +656,11 @@ def directory_scan():
                 this_scan['directorysize'] = this_scan['directorysize'] + filedict['size']
                 if (config['ultra_scan'] == True):
                     filedict['checksum'] = compute_file_hash(os.path.join(root,name))
-            except os.stat_result:
-                # permissions problem most likely, store as bad scan of file and iterate errors
+            except OSError as e:
+                # Store as bad scan of file and iterate errors
                 this_scan['errorcount'] = this_scan['errorcount'] + 1
-                logging.warn("File " + os.path.join(root,name) + " unreadable")
-                
+                logging.warn("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+
             if (config['is_source']):
                 # We're done scanning this file.  Put it into the array.
                 file_doc_batch.append(filedict)
@@ -682,31 +670,38 @@ def directory_scan():
                 filedict['source'] = False
                 
                 # Check for source file scanned in database 
-                source_id_hash = hashlib.sha1(config['other_host_id'] + os.path.join(root,name)).hexdigest()
-                if db_skew:
-                    source_file = older_scandb.all_docs(descending=True, startkey=source_id_hash, endkey=source_id_hash + str(99999999999999999999), limit=1)
+                # Passing a zero to ignore the timestamp and return only the unique file hash
+                source_id_hash = get_file_id(config['other_host_id'], os.path.join(root,name), this_scan['directory'], 0)
+                
+                logging.debug("other host ID: " + config['other_host_id'])
+                logging.debug("file path: " + os.path.join(root,name))
+                logging.debug("source_id_hash: " + source_id_hash)
+                
+                if db_logic['db_skew']:
+                    source_file = db_logic['older_scandb'].all_docs(descending=True, endkey=source_id_hash, startkey=source_id_hash + str(99999999999999999999), limit=1, include_docs=True)['rows']
                 else:
-                    source_file = scandb.all_docs(descending=True, startkey=source_id_hash, endkey=source_id_hash + str(99999999999999999999), limit=1)
+                    source_file = scandb.all_docs(descending=True, endkey=source_id_hash, startkey=source_id_hash + str(99999999999999999999), limit=1, include_docs=True)['rows']
                 
                 # If file has been scanned:
                 if len(source_file) > 0:
+                    logging.debug("Source file scanned on other host: YES")
                     # Get the file's Scan timestamp from it's ID
-                    sfst = source_file['_id'][40:]
+                    sfst = source_file[0]['id'][40:]
                     source_file_scan_time = int(sfst)
                     
                     # If the file scan timestamp is >= last successful scan date
-                    if (source_file_scan_time >= other_host_last_scan_complete):
+                    if (source_file_scan_time >= db_logic['other_host_last_scan_complete']):
                         # It's not orphaned
                         filedict['orphaned'] = 'no'
 
                         # But to determine if it's stale, check the scanned file's modified date against the most recent source version.
-                        thisview = scandb_views['sourcefiles']
-                        if db_skew:
-                            result = older_scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
+                        thisview = scandb_views['source_files']
+                        if db_logic['db_skew']:
+                            result = db_logic['older_scandb'].get_view_raw_result(thisview[0],thisview[1], key=source_file[0]['id'])['rows']
                         else:
-                            result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file['_id'])
+                            result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file[0]['id'])['rows']
                         
-                        if (result['value'] > filedict['datemodified']):
+                        if (len(result) > 0 and result[0]['value'] > filedict['datemodified']):
                             # If source is newer,
                             # In future, this may also include if the latest source scan is older than a configured age threshold
                             filedict['stale'] = True
@@ -722,6 +717,7 @@ def directory_scan():
 
                 # If the file hasn't ever been scanned on the source we don't know what it's status is
                 else:
+                    logging.debug("Source file scanned on other host: NO")
                     filedict['orphaned'] = "unknown"
                     filedict['stale'] = False
                 
@@ -771,17 +767,26 @@ def directory_scan():
 
 # Return the unique ID for a file based upon hash and last scan timestamp
 # Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the most recent UTC
-def get_file_id(host_id, full_path, timestamp):
+# Removes the passed top_dir in order to make the ID consistent between the hosts when the root path is not the same
+# Returns only the hash if a zero is passed as the timestamp
+def get_file_id(host_id, full_path, top_dir, timestamp):
+    # trim the top_dir from the full path
+    pathtrim = len(top_dir)
+    relative_path = full_path[pathtrim:]
+    logging.debug("Relative file path: " + relative_path)
     try:
-        f1 = full_path.decode('utf-8', errors='replace')
+        f1 = relative_path.decode('utf-8', errors='replace')
         filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest()
     except UnicodeDecodeError:
-        logging.warn("Path Decode error: " + full_path)
+        logging.warn("Path Decode error: " + relative_path)
         filehash = hashlib.sha1(host_id).hexdigest()        
     except UnicodeEncodeError:
-        logging.warn("Path Encode error: " + full_path)
+        logging.warn("Path Encode error: " + relative_path)
         filehash = hashlib.sha1(host_id).hexdigest()
-    return (filehash + str(timestamp))
+    if timestamp == 0:
+        return (filehash)
+    else:
+        return (filehash + str(timestamp))
 
 # Insanely-slow but ultra-effective scanner process that computes an md5 hash of every file it encounters
 # Currently this option is hard-coded to be disabled.
@@ -906,6 +911,29 @@ def purge_old_dbs(client):
                 doomed_db = Database(client,db)
                 doomed_db.delete()
 
+# Insert the passed dictionary of views into the passed database
+def populate_views(db, viewdict):
+    for viewname in viewdict:
+        view = viewdict[viewname]
+        ddoc = DesignDocument(db, document_id=view[0])
+        if (ddoc.exists()):
+            logging.debug("Design Document "+ view[0] +" found, adding view: " + view[1])
+            ddoc.fetch()
+            ddoc.add_view(view[1], view[2], reduce_func = view[3])
+            ddoc.save()
+        else:
+            try:
+                ddoc = DesignDocument(db, document_id=view[0])
+                ddoc.add_view(view[1], view[2], reduce_func=view[3])
+                ddoc.save()
+                logging.debug("Inserted design document " + view[0] + " view: " + view[1])
+            except Exception:
+                logging.fatal("Cannot insert design document into scan database: " + view[0])
+                sys.exit("Something has gone wrong. See log for details")
+
+# TO-DO: Utilize bulk calls to check for stale file states en-masse.
+def bulk_stale_check():
+    pass
 
 if __name__ == "__main__":
     main(sys.argv[1:])
