@@ -287,20 +287,18 @@ def check_relationship():
             # Stale files - Query View for stale files on target
             ddoc = scandb_views['target_scanned'][0]
             view = scandb_views['target_scanned'][1]
-            start_key = [target_scan_id,None,None]
-            end_key = [target_scan_id,{},True]
+            #start_key = [target_scan_id,None,None]
+            #end_key = [target_scan_id,{},True]
             result = scandb.get_view_result(ddoc,
                                             view,
-                                            startkey=start_key,
-                                            endkey=end_key,
                                             group_level=str(3),
                                             reduce=True
-                                            )['rows'][0]
-            
+                                            )
+            #result = view_result['rows'][0]
             # Get count of files stale and orphaned
-            orphaned_files = result[[target_scan_id, "yes", False]:[target_scan_id, "yes", True]]['count']
+            orphaned_files = result[[target_scan_id, "yes", False]:[target_scan_id, "yes", True]]
             print "Orphaned files result:"
-            print orphaned_files
+            pprint(orphaned_files)
             stale_files = result[target_scan_id,"no",True]['count'] + result[target_scan_id,"unknown",True]['count'] + orphaned_files
             syncresults.append(['Stale files on target',stale_files])
             syncresults.append(['Orphaned files on target',orphaned_files])
