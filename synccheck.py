@@ -19,6 +19,8 @@ from cloudant import cloudant
 import getpass
 import os
 from pprint import pprint
+import requests
+import re
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -164,25 +166,33 @@ def print_relationship(datalines):
     
     # Define print formatting
     width = 74
-    hostline = "| Source: {0:16d} | Target: {1:16d} |"
+    hostline = "| Source: {0:26} | Target: {1:25} |"
+    doubleline = "| {0:34} | {1:<33} |"
     header = "_" * width
     title = "Relationship between"
-    titleline = "|" + " "*((width/2)-2) + title + " "*((width/2)-2) + "|"
+    spacer = (width / 2 - 1) - (len(title)/2)
+    titleline = "|"+" "*(spacer) + title + " "*(spacer) + "|"
     divider = "|"+"-"*(width-2)+"|"
     footer = "|"+"_"*(width-2)+"|"
-    dataline = "| {0:11d}: {1:11d} | {2:11d}: {3:11d} |"
+    dataline = "| {0:21}: {1:<11} | {2:20}: {3:<11} |"
     
     # Output to shell
     print header
     print titleline
     print divider
     print hostline.format(config['source_name'], config['target_name'])
+    print doubleline.format("Last Scanned At:","Last Scanned At:")
+    # Print date scanned
+    print doubleline.format(datalines[2][1],datalines[2][3])
     print divider
-    for thisline in datalines:
-        if len(thisline[0]) > 1:
-            print dataline.format(thisline[0],thisline[1],thisline[2],thisline[3])
-        else:
-            print hostline.format(thisline[1],thisline[2])
+    # Print middle items
+    lines = [5,0,1,3,4]
+    for val in lines:
+        print dataline.format(datalines[val][0],datalines[val][1],datalines[val][2],datalines[val][3])
+    # Print final stats
+    lines = [6,7,8]
+    for line in lines:
+        print doubleline.format(datalines[line][1],datalines[line][2])
     print footer
 
 # Output a formatted date/time from UTC timestamp
@@ -220,7 +230,7 @@ def check_relationship():
                     resultslist.append([key, host_scan[key]])
                     
             # Get most recent scan doc for host from view
-            # TO-DO : {emit([doc.hostID, doc.success, doc.started], doc.database);}
+            # {emit([doc.hostID, doc.success, doc.started], doc.database);}
             # Get the other host's last scan info (if it exists, even if it's running)
             beginhere = [host,True,{}]
             endhere = [host,False,0]
@@ -251,7 +261,8 @@ def check_relationship():
                 else:
                     host_scan['Scan_complete'] = "No"
                 # Scan database name
-                host_scan['Scan_Database'] = view_result['value']
+                host_scan['Scan_Database'] = re.sub('scandb-','',view_result['value'])
+                config['scan_db_name'] = view_result['value']
                         
             # If host's last scan doesn't exist, change host name to UNSCANNED
             # Don't allow sync results check to run
@@ -274,44 +285,121 @@ def check_relationship():
             
         if (get_sync_results):    
             # Get statistics about sync state:
-            syncresults = []
-            # Missing files -NEEDS IMPROVEMENT, CANNOT USE OPERATIONAL VIEWS PRESENTLY
-            syncresults.append(['Files missing from target',sourceresults[0][1] - targetresults[0][1]])
+            # syncresults = []
+            # syncresults.append(['Files missing from target',sourceresults[0][1] - targetresults[0][1]])
             # Open scan database
             try:
-                print targetresults[4][1]
-                scandb = client[targetresults[4][1]]
+                scandb = client[config['scan_db_name']]
             except:
                 sys.exit("Can't open scan database")
-
-            # Stale files - Query View for stale files on target
-            ddoc = scandb_views['target_scanned'][0]
-            view = scandb_views['target_scanned'][1]
-            #start_key = [target_scan_id,None,None]
-            #end_key = [target_scan_id,{},True]
-            result = scandb.get_view_result(ddoc,
-                                            view,
-                                            group_level=str(3),
-                                            reduce=True
-                                            )
-            #result = view_result['rows'][0]
-            # Get count of files stale and orphaned
-            orphaned_files = result[[target_scan_id, "yes", False]:[target_scan_id, "yes", True]]
-            print "Orphaned files result:"
-            pprint(orphaned_files)
-            stale_files = result[target_scan_id,"no",True]['count'] + result[target_scan_id,"unknown",True]['count'] + orphaned_files
-            syncresults.append(['Stale files on target',stale_files])
-            syncresults.append(['Orphaned files on target',orphaned_files])
+                
+            stale_files = 0
+            orphaned_files = 0
+            # Stale files - Query View for stale files on target            
+            # stale_result = stale_view(scandb, target_scan_id) BROKEN DUE TO Cloudant-Python BUG
+            stale_result = stale_view_temp(target_scan_id)
+            if len(stale_result) > 0:
+                for row in stale_result:
+                    if row['key'][2] == True:
+                        stale_files = stale_files + row['value']['count']
+            
+            # Orphaned files - Query view for orphand files on target
+            # orphan_result = orphan_view(scandb, target_scan_id) BROKEN DUE TO Cloudant-Python BUG
+            orphan_result = orphan_view_temp(target_scan_id)
+            if len(orphan_result) > 0:
+                orphaned_files = orphan_result[0]['value']['count']
+                
+            # MISSING FILES NEEDS IMPROVEMENT, NOT USING OPERATIONAL VIEWS PRESENTLY
+            missing_files = results[0][1] - results[0][3]
+            results.append(['','Probable missing files on target',missing_files,''])            
+            results.append(['','Orphaned files on target',orphaned_files,''])
+            results.append(['','Stale files on target',stale_files,''])
             
             # TO-DO: Final sync percentage by bytes
-            
-            # Append to results (fill blanks into 1st and 4th)
-            for key in syncresults:
-                thisline = ['',syncresults[key][0],syncresults[key][1],'']
-                results.append(thisline)
                 
     return(results)
 
+def stale_view_temp(scan_id):
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        config['scan_db_name'],
+        scandb_views['target_scanned'][0],
+        scandb_views['target_scanned'][1]
+    )
+    payload = {
+        "startkey": '["'+scan_id+'",null,null]',
+        "endkey": '["'+scan_id+'",{},true]',
+        "group_level": 3,
+        "reduce": 'true',
+    }
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth']),
+        params = payload
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        print url
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    return jsondata['rows']
+    
+def orphan_view_temp(scan_id):
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        config['scan_db_name'],
+        scandb_views['target_scanned'][0],
+        scandb_views['target_scanned'][1]
+    )
+    payload = {
+        "startkey": '["'+scan_id+'","yes"]',
+        "endkey": '["'+scan_id+'","yes"]',
+        "group_level": 2,
+        "reduce": 'true',
+    }
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth']),
+        params = payload
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        print url
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    return jsondata['rows']
+
+# BROKEN due to Cloudant-Python bug on "group_level"
+def stale_view(scandb,scan_id):
+    ddoc = scandb_views['target_scanned'][0]
+    view = scandb_views['target_scanned'][1]
+    start_key = [scan_id,None,None]
+    end_key = [scan_id,{},True]
+    result = scandb.get_view_raw_result(ddoc,
+                                        view,
+                                        group_level=3,
+                                        startkey = start_key,
+                                        endkey = end_key,
+                                        reduce=True
+                                        )['rows']
+    return (result)
+
+# BROKEN due to Cloudant-Python bug on "group_level"
+def orphan_view(scandb,scan_id):
+    ddoc = scandb_views['target_scanned'][0]
+    view = scandb_views['target_scanned'][1]
+    start_key = [scan_id,"yes"]
+    end_key = [scan_id,"yes"]
+    result = scandb.get_view_raw_result(ddoc,
+                                        view,
+                                        group_level=2,
+                                        startkey = start_key,
+                                        endkey = end_key,
+                                        reduce=True
+                                        )['rows']
+    return (result)
 
 if __name__ == "__main__":
     main(sys.argv[1:])
