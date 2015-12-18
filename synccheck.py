@@ -38,7 +38,7 @@ config = dict(
     # Cloudant password
     cloudant_auth = '',
     # Help string printed if invalid options or '-h' used
-    help_text = "Usage: synccheck.py -c <configfile>  (If no config file specified, script reads ./dirscansync.json by default)",
+    help_text = "Usage: synccheck.py -c <configfile> -r <interval>",
     # ID of the relationship for this sync (Cloudant doc _id)
     relationship = '',
     # Flags for current relationship's sync setup
@@ -105,25 +105,38 @@ maindb_views = dict(
 def main(argv):
     # Check options for validity, print help if user fat-fingered anything
     try:
-        opts, args = getopt.getopt(argv,"hc:")
+        opts, args = getopt.getopt(argv,"hc:r:")
     except getopt.GetoptError:
         print config['help_text']
         sys.exit(2)
-        
+    
+    continuous = False    
     for opt, arg in opts:
         if opt == '-h':
             print config['help_text']
             sys.exit()
         elif opt in ("-c"):
             config['config_file'] = arg
+        elif opt in ("-r"):
+            continuous = True
+            if (len(arg) == 0 or int(arg) < 1):
+                interval = int(5 * 60)
+            else:
+                interval = int(arg) * 60
         
     load_config(config['config_file'])
     
+    while (continuous):
+        results = check_relationship()
+        print_relationship(results)
+        time.sleep(interval)
+        
     results = check_relationship()
     print_relationship(results)
     
 
 # Load configuration from file and database into configuration dictionary
+# Gets us: hostIDs, relationshipID, auth, dirs, host names, rsync flags, threshold, maindbname
 def load_config(config_file):
     try:
         data = open(config_file)
@@ -162,7 +175,7 @@ def load_config(config_file):
             config['target_ip'] = doc['ip4']
         
 # Print the status of the relationship with pretty formatting
-def print_relationship(datalines):
+def print_relationship(data):
     
     # Define print formatting
     width = 74
@@ -180,19 +193,32 @@ def print_relationship(datalines):
     print header
     print titleline
     print divider
-    print hostline.format(config['source_name'], config['target_name'])
+    print hostline.format(data['hostnames'][0], data['hostnames'][1])
     print doubleline.format("Last Scanned At:","Last Scanned At:")
     # Print date scanned
-    print doubleline.format(datalines[2][1],datalines[2][3])
+    print doubleline.format(data['scandates'][0],data['scandates'][1])
     print divider
     # Print middle items
-    lines = [5,0,1,3,4]
-    for val in lines:
-        print dataline.format(datalines[val][0],datalines[val][1],datalines[val][2],datalines[val][3])
-    # Print final stats
-    lines = [6,7,8]
+    lines = [
+        ["Scan completed",'scancomplete'],
+        ["Files",'filecount'],
+        ["Directory size",'dirsize'],
+        ["Scanning errors", 'errors'],
+        ["Scan database", 'scandbs']
+    ]
     for line in lines:
-        print doubleline.format(datalines[line][1],datalines[line][2])
+        label = line[0]
+        datapoints = data[line[1]]
+        print dataline.format(label,datapoints[0],label,datapoints[1])
+    # Print final stats
+    lines = [
+        ["Files missing from target", 'missing'],
+        ["Orphaned files on target", 'orphaned'],
+        ["Stale files on target", 'stale']
+    ]
+    for line in lines:
+        label = line[0]
+        print doubleline.format(label,data[line[1]])
     print footer
     print ""
 
@@ -200,123 +226,74 @@ def print_relationship(datalines):
 def pretty_time(timestamp):
     return (datetime.fromtimestamp(timestamp).ctime())
 
-# Obtain the appropriate relationship information and return the populated list
-# results = [[host1,data,host2,data],[host1,data,host2,data],...]
 def check_relationship():
-    sourceresults = []
-    targetresults = []
-    results = []
-    get_sync_results = True
-    target_scan_id = ''
+    pass
+    # Source is always first in each array, target is always second
+    results = dict(
+        hostnames = [],
+        scandates = [],
+        scancomplete = [],
+        filecount = [],
+        dirsize = [],
+        errors = [],
+        scandbs = [],
+        missing = 0,
+        orphaned = 0,
+        stale = 0
+    )
+
+    # Store hostnames
+    results['hostnames'] = [config['source_name'],config['target_name']]
     
-    # Connect to database
-    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
-        db = client[config['main_db_name']]
-        # Data we need for each host:
-        for host in (config['rsync_source'], config['rsync_target']):
-            
-            # Data set for this host
-            host_scan = dict(
-                Scan_complete = 'No',
-                Last_scanned = '',
-                Files = '',
-                Scanning_errors = '',
-                Directory_size = '',
-                Scan_Database = ''
-            )
-            
-            # Function to fill one array or the other
-            def fill_scan_line(resultslist):
-                for key in host_scan.keys():
-                    resultslist.append([key, host_scan[key]])
-                    
-            # Get the other host's last scan info (if it exists, even if it's running)
-            view_result = get_scan_db(host)
-            
-            # Open host's last scan doc (if exists)
-            if (len(view_result) > 0):
-                # NEEDS IMPROVEMENT - All data coming from host's last scan doc
-                # This means this data only updates when a scan document is updated!
-                # Last scan time
-                host_scan['Last_scanned'] = pretty_time(view_result['key'][2])
-                # Files found
-                host_scan['Files'] = "{:,}".format(view_result['doc']['filecount'])
-                # Scan errors
-                host_scan['Scanning_errors'] = view_result['doc']['errorcount']
-                # Total data size
-                host_scan['Directory_size'] = data_size_pretty(view_result['doc']['directorysize'])
-                # Did the last scan finish?
-                if view_result['doc']['ended'] > 0:
-                    host_scan['Scan_complete'] = "Yes"
-                else:
-                    host_scan['Scan_complete'] = "No"
-                # Scan database name
-                host_scan['Scan_Database'] = re.sub('scandb-','',view_result['value'])
-                config['scan_db_name'] = view_result['value']
-                        
-            # If host's last scan doesn't exist, change host name to UNSCANNED
-            # Don't allow sync results check to run
-            else:
-                host = "UNSCANNED"
-                get_sync_results = False
-                    
-            # If host is source
-            if (host == config['rsync_source']):
-                fill_scan_line(sourceresults)
-                source_scan_id = view_result['id']
-            # Host is target
-            else:
-                fill_scan_line(targetresults)
-                target_scan_id = view_result['id']
-                
-        # Populate results[] using source & target
-        for i,item in enumerate(sourceresults):
-            thisline = [sourceresults[i][0], sourceresults[i][1], targetresults[i][0], targetresults[i][1]]
-            results.append(thisline)
-            
-        if (get_sync_results):    
-            # Get statistics about sync state:
-            # syncresults = []
-            # syncresults.append(['Files missing from target',sourceresults[0][1] - targetresults[0][1]])
-            # Open scan database
-            try:
-                scandb = client[config['scan_db_name']]
-            except:
-                sys.exit("Can't open scan database")
-                
-            stale_files = 0
-            orphaned_files = 0
-            # Stale files - Query View for stale files on target            
-            # stale_result = stale_view(scandb, target_scan_id) BROKEN DUE TO Cloudant-Python BUG
-            stale_result = stale_view_temp(target_scan_id)
-            if len(stale_result) > 0:
-                for row in stale_result:
-                    if row['key'][2] == True:
-                        stale_files = stale_files + row['value']['count']
-            
-            # Orphaned files - Query view for orphand files on target
-            # orphan_result = orphan_view(scandb, target_scan_id) BROKEN DUE TO Cloudant-Python BUG
-            orphan_result = orphan_view_temp(target_scan_id)
-            if len(orphan_result) > 0:
-                orphaned_files = orphan_result[0]['value']['count']
-                
-            source_files_so_far = files_scanned_temp(config['rsync_source'])
-            target_files_so_far = files_scanned_temp(config['rsync_target'])
-            
-            missing_files = "{:,}".format(source_files_so_far['count'] - target_files_so_far['count'])
-            
-            results.append(['','Probable missing files on target',missing_files,''])            
-            results.append(['','Orphaned files on target',orphaned_files,''])
-            results.append(['','Stale files on target',stale_files,''])
-            
-            # TO-DO: Final sync percentage by bytes
-                
+    # Get both hosts' last scan info
+    sourcescan = get_scan_db(config['rsync_source'])
+    targetscan = get_scan_db(config['rsync_target'])
+    
+    # From each scan we need:
+    # 1. Date scan started
+    results['scandates'] = [pretty_time(sourcescan['key'][2]),pretty_time(targetscan['key'][2])]
+    
+    # 2. If the scan is complete
+    if (sourcescan['doc']['ended'] > 0):
+        sourcescan_ended = "Yes"
+    else:
+        sourcescan_ended = "No"
+    if (targetscan['doc']['ended'] > 0):
+        targetscan_ended = "Yes"
+    else:
+        targetscan_ended = "No"
+    results['scancomplete'] = [sourcescan_ended,targetscan_ended]
+    
+    # 3. the scan DB each host is using
+    results['scandbs'] = [re.sub('scandb-','',sourcescan['value']),re.sub('scandb-','',targetscan['value'])]
+    
+    # From each scandb for each host:
+    source_files_so_far = files_scanned(sourcescan['value'], sourcescan['id'], config['rsync_source'])
+    target_files_so_far = files_scanned(targetscan['value'], targetscan['id'], config['rsync_target'])
+    # number of files scanned
+    results['filecount'] = ["{:,}".format(source_files_so_far['count']),"{:,}".format(target_files_so_far['count'])]
+    
+    # number of errors in scan
+    results['errors'] = [scanning_errors(sourcescan['value'],sourcescan['id']),scanning_errors(targetscan['value'],targetscan['id'])]
+    
+    # total size of scanned files (directory size)
+    results['dirsize'] = [data_size_pretty(source_files_so_far['sum']),data_size_pretty(target_files_so_far['sum'])]
+    
+    # For summary stats:
+    # missingfiles = sourcefiles - targetfiles from above
+    results['missing'] = "{:,}".format(source_files_so_far['count'] - target_files_so_far['count'])
+    # orphaned files = from view
+    results['orphaned'] = "{:,}".format(orphan_view(targetscan['value'],targetscan['id']))
+    # stale files = from view
+    results['stale'] = "{:,}".format(stale_view(targetscan['value'],targetscan['id']))
+    # send back a results dictionary the printer can parse
     return(results)
 
-def stale_view_temp(scan_id):
+def stale_view(scan_db, scan_id):
+    stale_files = 0
     url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
         config['cloudant_account'],
-        config['scan_db_name'],
+        scan_db,
         scandb_views['target_scanned'][0],
         scandb_views['target_scanned'][1]
     )
@@ -336,12 +313,17 @@ def stale_view_temp(scan_id):
     else:
         response.raise_for_status()
         sys.exit("Bad http request")
-    return jsondata['rows']
-    
-def orphan_view_temp(scan_id):
+    if len(jsondata['rows']) > 0:
+        for row in jsondata['rows']:
+            if row['key'][2] == True:
+                stale_files = stale_files + row['value']['count']
+    return(stale_files)
+
+def orphan_view(scan_db,scan_id):
+    orphaned_files = 0
     url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
         config['cloudant_account'],
-        config['scan_db_name'],
+        scan_db,
         scandb_views['target_scanned'][0],
         scandb_views['target_scanned'][1]
     )
@@ -361,7 +343,9 @@ def orphan_view_temp(scan_id):
     else:
         response.raise_for_status()
         sys.exit("Bad http request")
-    return jsondata['rows']
+    if len(jsondata['rows']) > 0:
+        orphaned_files = jsondata['rows'][0]['value']['count']
+    return(orphaned_files)
 
 def get_scan_db(host):
     thisview = maindb_views['recent_scans']
@@ -391,11 +375,7 @@ def get_scan_db(host):
         sys.exit("Bad http request")
     return jsondata['rows'][0]
 
-def files_scanned_temp(host_id):
-    
-    scan_database_info = get_scan_db(host_id)
-    scan_database = scan_database_info['value']
-    scan_id = scan_database_info['id']
+def files_scanned(scan_database, scan_id, host_id):
     url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
         config['cloudant_account'],
         scan_database,
@@ -418,13 +398,45 @@ def files_scanned_temp(host_id):
     else:
         response.raise_for_status()
         sys.exit("Bad http request")
-    return (jsondata['rows'][0]['value'])
+    if len(jsondata['rows']) > 0:
+        return (jsondata['rows'][0]['value'])
+    else:
+        zeroes = dict(
+            sum = 0,
+            count = 0,
+            min = 0,
+            max = 0,
+            sumsqr = 0
+        )
+        return (zeroes)
 
-def directory_size_temp(scan_id):
-    pass
-
-def scanning_errors_temp(scan_id):
-    pass
+def scanning_errors(scan_db, scan_id):
+    errors = 0
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        scan_db,
+        scandb_views['problem_files'][0],
+        scandb_views['problem_files'][1]
+    )
+    payload = {
+        "startkey": '["'+scan_id+'",null,null]',
+        "endkey": '["'+scan_id+'",{},{}]',
+        "group_level": 1,
+        "reduce": 'true',
+    }
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth']),
+        params = payload
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    if len(jsondata['rows']) > 0:
+        errors = jsondata['rows'][0]['value']
+    return(errors)
 
 def data_size_pretty(size):
     measure = 0
@@ -436,7 +448,7 @@ def data_size_pretty(size):
     return (formattedsize + codes[measure])
 
 # BROKEN due to Cloudant-Python bug on "group_level"
-def stale_view(scandb,scan_id):
+def stale_view_cp(scandb,scan_id):
     ddoc = scandb_views['target_scanned'][0]
     view = scandb_views['target_scanned'][1]
     start_key = [scan_id,None,None]
@@ -451,7 +463,7 @@ def stale_view(scandb,scan_id):
     return (result)
 
 # BROKEN due to Cloudant-Python bug on "group_level"
-def orphan_view(scandb,scan_id):
+def orphan_view_cp(scandb,scan_id):
     ddoc = scandb_views['target_scanned'][0]
     view = scandb_views['target_scanned'][1]
     start_key = [scan_id,"yes"]
