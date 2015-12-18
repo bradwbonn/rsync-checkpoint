@@ -98,7 +98,7 @@ scandb_views = dict(
     file_types = [
         '_design/files',
         'typesscanned',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = fname.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
         '_stats'
     ],
     target_scanned = [
