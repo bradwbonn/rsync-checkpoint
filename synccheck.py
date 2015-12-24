@@ -227,7 +227,6 @@ def pretty_time(timestamp):
     return (datetime.fromtimestamp(timestamp).ctime())
 
 def check_relationship():
-    pass
     # Source is always first in each array, target is always second
     results = dict(
         hostnames = [],

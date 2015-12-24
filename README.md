@@ -36,8 +36,8 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * Create a cron task (or manually execute) the scan using `dirscan.py -c dirscansync.json` as a user which has full local read access to directory being scanned
 
 ## How to use the command-line tool
-* Once scanning is configured, run synccheck.py either in the same directory as the configuration file the scanner uses, or point it to the scanner using `python synccheck.py -c <configfile>`
-* The output will show the current state of the two replica filesystems with one another, accounting for any ignored files or paths
+* Once scanning is configured, run synccheck.py either in the same directory as the configuration file the scanner uses, or point it to the scanner using `python synccheck.py -c <configfile> -r <minutes>`
+* The output will show the current state of the two replica filesystems with one another, accounting for any ignored files or paths. Passing `-r` causes the script to continuously update the status every `<minutes>`.
     
 ## Known Issues/Limitations:
 * Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them
