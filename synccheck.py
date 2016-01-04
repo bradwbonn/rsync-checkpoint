@@ -439,8 +439,9 @@ def scanning_errors(scan_db, scan_id):
 
 def data_size_pretty(size):
     measure = 0
+    size = float(size)
     while (size > 1024):
-        size = size / 1024
+        size = round(size / 1024, 2)
         measure = measure + 1
     codes = ['',' KB',' MB',' GB',' TB',' PB']
     formattedsize = "{:,}".format(size)
