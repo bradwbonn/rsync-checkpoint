@@ -912,15 +912,21 @@ def purge_old_dbs(client):
                 doomed_db.delete()
 
 # Insert the passed dictionary of views into the passed database
+# Needs a method for upgrading existing views in case they change with a new version of the script
 def populate_views(db, viewdict):
     for viewname in viewdict:
         view = viewdict[viewname]
         ddoc = DesignDocument(db, document_id=view[0])
         if (ddoc.exists()):
-            logging.debug("Design Document "+ view[0] +" found, adding view: " + view[1])
+            # If view exists, go to the next one. Otherwise create it
             ddoc.fetch()
-            ddoc.add_view(view[1], view[2], reduce_func = view[3])
-            ddoc.save()
+            try:
+                ddoc.get_view(view[1])
+                logging.debug("Design document and view found, moving on")
+            except:
+                logging.debug("Design document "+ view[0] +" found, adding view: " + view[1])
+                ddoc.add_view(view[1], view[2], reduce_func = view[3])
+                ddoc.save()
         else:
             try:
                 ddoc = DesignDocument(db, document_id=view[0])
