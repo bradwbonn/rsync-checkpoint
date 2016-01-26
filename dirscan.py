@@ -1161,6 +1161,8 @@ def check_views(dbname, c, views):
                     ddoc.save()
                 else:
                     continue
+        versiondoc.update_field(action=versiondoc.list_field_append, field='history', value = versiondoc['current'])
+        versiondoc.update_field(action=versiondoc.field_set, field='current', value = config['viewversion'])
 
 if __name__ == "__main__":
     main()
