@@ -4,7 +4,6 @@
 
 # Prep
 import json
-import getopt
 import base64
 import sys
 import hashlib
@@ -21,6 +20,7 @@ import os
 from pprint import pprint
 import requests
 import re
+import argparse
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -56,34 +56,8 @@ config = dict(
     # IP addresses of hosts in the relationship
     host_id = '',
     source_ip = '',
-    target_ip = ''
-)
-
-scandb_views = dict(
-    file_types = [
-        '_design/files',
-        'typesscanned',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
-        '_stats'
-    ],
-    target_scanned = [
-        '_design/scanresults',
-        'targetfiles',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false) {emit([doc.scanID, doc.orphaned, doc.stale], doc.size);}}',
-        '_stats'
-    ],
-    problem_files = [ 
-        '_design/files',
-        'problemfiles',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === false) {emit([doc.scanID,doc.path,doc.name], 1);}}',
-        '_count'
-    ],
-    source_files = [
-        '_design/sourcefiles',
-        'sourcefiles',
-        'function (doc) { if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc.id, doc.datemodified); }}',
-        None
-    ]
+    target_ip = '',
+    viewversion = 0.03
 )
 
 maindb_views = dict(
@@ -101,51 +75,132 @@ maindb_views = dict(
                     "_count"]
 )
 
+scandb_views = dict(
+    file_types = [
+        '_design/files',
+        'typesscanned',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
+        '_stats'
+    ],
+    problem_files = [ 
+        '_design/files',
+        'problemfiles',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === false) {emit([doc.scanID,doc.path,doc.name], 1);}}',
+        '_count'
+    ],
+    source_files = [
+        '_design/sourcefiles',
+        'sourcefiles',
+        'function (doc) { if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc._id, doc.datemodified); }}',
+        None
+    ],
+    uptodate_files = [
+        '_design/syncstate',
+        'uptodate',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "no" && (doc.datemodified >= doc.sourcemodified)) {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    stale_files = [
+        '_design/syncstate',
+        'stale',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "no" && (doc.datemodified < doc.sourcemodified)) {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    orphaned_files = [
+        '_design/syncstate',
+        'orphaned',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "yes") {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    unknown_files = [
+        '_design/syncstate',
+        'unknown',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "unknown") {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    source_prefixes = [
+        '_design/sourcefiles',
+        'prefixes',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc.IDprefix,doc.datemodified)}}',
+        '_count'
+    ],
+    missing_files = [
+        '_design/syncstate',
+        'missing',
+        'function (doc) {if (doc.type === "file") {emit([doc.syncpath,doc.name,doc.host],doc.size);}',
+        '_stats'
+    ]
+)
+
+# Search design documents
+search_indexes = dict(
+    files = [
+        '_design/search',
+        'files',
+        'function (doc) { index("name", doc.name, "store": true); index("path", doc.path);}',
+        None
+    ]
+)
+
 # Main
-def main(argv):
-    # Check options for validity, print help if user fat-fingered anything
-    try:
-        opts, args = getopt.getopt(argv,"hc:r:")
-    except getopt.GetoptError:
-        print config['help_text']
-        sys.exit(2)
+def main():
+    argparser = argparse.ArgumentParser(description = 'Directory "sync" status checking tool for rsync-checkpoint')
+    argparser.add_argument(
+        '-c',
+        metavar='config file',
+        type=file,
+        nargs='?',
+        help='Configuration file to use for sync check. Defaults to trying {0}'.format(config['config_file']),
+        default = config['config_file']
+        )
+    argparser.add_argument(
+        '-r',
+        metavar='minutes',
+        type=int,
+        nargs='?',
+        help='Make script run continusouly, each specified number of minutes',
+        default = 0
+        )
+    argparser.add_argument(
+        '--detail',
+        metavar='flags',
+        type=str,
+        nargs='?',
+        help='Add s for stale files, o for orphaned files, e for files with scan errors, m for missing files. For example, listing all would be [--detail some]'
+    )
+
+    myargs = argparser.parse_args()
+    load_config(myargs.c)
+    interval = myargs.r * 60
     
-    continuous = False    
-    for opt, arg in opts:
-        if opt == '-h':
-            print config['help_text']
-            sys.exit()
-        elif opt in ("-c"):
-            config['config_file'] = arg
-        elif opt in ("-r"):
-            continuous = True
-            if (len(arg) == 0 or int(arg) < 1):
-                interval = int(5 * 60)
-            else:
-                interval = int(arg) * 60
-        
-    load_config(config['config_file'])
-    
-    while (continuous):
+    while (interval != 0):
         results = check_relationship()
         print_relationship(results)
         time.sleep(interval)
         
     results = check_relationship()
     print_relationship(results)
-    
+    if myargs.detail != None:
+        sourcescan = get_scan_db(config['rsync_source'])
+        targetscan = get_scan_db(config['rsync_target'])
+        #source_scandb = sourcescan['value']
+        #target_scandb = targetscan['value']
+        #source_scanid = sourcescan['id']
+        #target_scanid = targetscan['id']
+        if 's' in myargs.detail:
+            print_stales(config['rsync_target'], targetscan)
+        if 'o' in myargs.detail:
+            print_orphans(config['rsync_target'], targetscan)
+        if 'm' in myargs.detail:
+            print_missing(sourcescan,targetscan)
+        if 'e' in myargs.detail:
+            print_errors(sourcescan,targetscan)
 
 # Load configuration from file and database into configuration dictionary
 # Gets us: hostIDs, relationshipID, auth, dirs, host names, rsync flags, threshold, maindbname
 def load_config(config_file):
-    try:
-        data = open(config_file)
-    except IOError as e:
-        print "I/O error({0}): {1}".format(e.errno, e.strerror)
-        print "Unable to load configuration file, exiting."
-        sys.exit(2)
-    config_json = json.load(data)
-    data.close()
+    config_json = json.load(config_file)
+    config_file.close()
     config['cloudant_auth'] = config_json['cloudant_auth']
     config['cloudant_user'] = config_json['cloudant_user']
     config['cloudant_account'] = config_json['cloudant_account']
@@ -174,6 +229,72 @@ def load_config(config_file):
             config['target_name'] = doc['hostname']
             config['target_ip'] = doc['ip4']
         
+def print_errors(sourcescan,targetscan):
+    startkey = '["{0}",{1},{2}]'.format(sourcescan['id'],'null','null')
+    endkey = '["{0}",{1},{2}]'.format(sourcescan['id'],'{}','{}')
+    sourceerrors = get_view(
+        sourcescan['value'],
+        scandb_views['problem_files'][0],
+        scandb_views['problem_files'][1],
+        False,
+        0,
+        startkey,
+        endkey,
+        False
+    )
+    startkey = '["{0}",{1},{2}]'.format(targetscan['id'],'null','null')
+    endkey = '["{0}",{1},{2}]'.format(targetscan['id'],'{}','{}')
+    targeterrors = get_view(
+        targetscan['value'],
+        scandb_views['problem_files'][0],
+        scandb_views['problem_files'][1],
+        False,
+        0,
+        startkey,
+        endkey,
+        False
+    )
+    for row in sourceerrors['rows']:
+        print " Couldn't scan source: {0}{1}".format(row['key'][1],row['key'][2])
+    for row in targeterrors['rows']:
+        print " Couldn't scan target: {0}{1}".format(row['key'][1],row['key'][2])
+    print ""
+
+def print_orphans(host, targetscan):
+    startkey = '["{0}","{1}",{2}]'.format(host, targetscan['id'],'null')
+    endkey = '["{0}","{1}",{2}]'.format(host, targetscan['id'],'{}')
+    orphans = get_view(
+        targetscan['value'],
+        scandb_views['orphaned_files'][0],
+        scandb_views['orphaned_files'][1],
+        False,
+        0,
+        startkey,
+        endkey,
+        True
+    )
+    for row in orphans['rows']:
+        print " Orphaned {0} file on target: {1}/{2}".format(data_size_pretty(row['value']),row['doc']['path'],row['doc']['name'])
+
+def print_missing(sourcescan,targetscan):
+    pass
+
+def print_stales(host, targetscan):
+    startkey = '["{0}","{1}",{2}]'.format(host, targetscan['id'],'null')
+    endkey = '["{0}","{1}",{2}]'.format(host, targetscan['id'],'{}')
+    stales = get_view(
+        targetscan['value'],
+        scandb_views['stale_files'][0],
+        scandb_views['stale_files'][1],
+        False,
+        0,
+        startkey,
+        endkey,
+        True
+    )
+    for row in stales['rows']:
+        print " Stale {0} file on target: {1}/{2}".format(data_size_pretty(row['value']),row['doc']['path'],row['doc']['name'])
+
 # Print the status of the relationship with pretty formatting
 def print_relationship(data):
     
@@ -212,15 +333,54 @@ def print_relationship(data):
         print dataline.format(label,datapoints[0],label,datapoints[1])
     # Print final stats
     lines = [
-        ["Files missing from target", 'missing'],
+        ["Files safely on target", 'uptodate'],
+        ["Files needing to sync", 'missing'],
         ["Orphaned files on target", 'orphaned'],
-        ["Stale files on target", 'stale']
+        ["Stale files on target", 'stale'],
+        ["Files whose sync state is unknown",'unknown']
     ]
     for line in lines:
         label = line[0]
         print doubleline.format(label,data[line[1]])
     print footer
     print ""
+
+def get_view(db,ddoc,view,reduce,group_level,startkey,endkey,include_docs):
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        db,
+        ddoc,
+        view
+        )
+    
+    if reduce == True:
+        reduce_str = 'true'
+    else:
+        reduce_str = 'false'
+    url = url + '?' + 'reduce={0}'.format(reduce_str)
+
+    if group_level > 0:
+        url = url + '&' + '{0}={1}'.format('group_level',group_level)
+
+    if len(startkey) > 0:
+        url = url + '&' + '{0}={1}'.format('startkey',startkey)
+
+    if len(endkey) > 0:
+        url = url + '&' + '{0}={1}'.format('endkey',endkey)
+
+    if include_docs == True:
+        url = url + '&' + '{0}={1}'.format('include_docs','true')
+  
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth'])
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    return(jsondata)
 
 # Output a formatted date/time from UTC timestamp
 def pretty_time(timestamp):
@@ -256,11 +416,11 @@ def check_relationship():
     if (sourcescan['doc']['ended'] > 0):
         sourcescan_ended = "Yes"
     else:
-        sourcescan_ended = "No"
+        sourcescan_ended = "*No*"
     if (targetscan['doc']['ended'] > 0):
         targetscan_ended = "Yes"
     else:
-        targetscan_ended = "No"
+        targetscan_ended = "*No*"
     results['scancomplete'] = [sourcescan_ended,targetscan_ended]
     
     # 3. the scan DB each host is using
@@ -279,27 +439,31 @@ def check_relationship():
     results['dirsize'] = [data_size_pretty(source_files_so_far['sum']),data_size_pretty(target_files_so_far['sum'])]
     
     # For summary stats:
+    # Up to date files
+    uptodate = good_files(config['rsync_target'],targetscan['value'],targetscan['id'])
+    results['uptodate'] = "{:,}".format(uptodate)
     # missingfiles = sourcefiles - targetfiles from above
-    results['missing'] = "{:,}".format(source_files_so_far['count'] - target_files_so_far['count'])
+    results['missing'] = "{:,}".format(source_files_so_far['count'] - uptodate)
     # orphaned files = from view
-    results['orphaned'] = "{:,}".format(orphan_view(targetscan['value'],targetscan['id']))
+    results['orphaned'] = "{:,}".format(orphan_view(config['rsync_target'],targetscan['value'],targetscan['id']))
     # stale files = from view
-    results['stale'] = "{:,}".format(stale_view(targetscan['value'],targetscan['id']))
+    results['stale'] = "{:,}".format(stale_view(config['rsync_target'],targetscan['value'],targetscan['id']))
+    # Unknown files
+    results['unknown'] = "{:,}".format(unknown_files(config['rsync_target'],targetscan['value'],targetscan['id']))
     # send back a results dictionary the printer can parse
     return(results)
 
-def stale_view(scan_db, scan_id):
-    stale_files = 0
+def good_files(host_id,scan_db,scan_id):
+    goods = 0
     url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
         config['cloudant_account'],
         scan_db,
-        scandb_views['target_scanned'][0],
-        scandb_views['target_scanned'][1]
+        scandb_views['uptodate_files'][0],
+        scandb_views['uptodate_files'][1]
     )
     payload = {
-        "startkey": '["'+scan_id+'",null,null]',
-        "endkey": '["'+scan_id+'",{},true]',
-        "group_level": 3,
+        "startkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'null'),
+        "endkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'{}'),
         "reduce": 'true',
     }
     response = requests.get(
@@ -313,23 +477,75 @@ def stale_view(scan_db, scan_id):
         response.raise_for_status()
         sys.exit("Bad http request")
     if len(jsondata['rows']) > 0:
-        for row in jsondata['rows']:
-            if row['key'][2] == True:
-                stale_files = stale_files + row['value']['count']
+        goods = jsondata['rows'][0]['value']['count']
+    return(goods)
+    
+
+def unknown_files(host_id, scan_db, scan_id):
+    unknowns = 0
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        scan_db,
+        scandb_views['unknown_files'][0],
+        scandb_views['unknown_files'][1]
+    )
+    payload = {
+        "startkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'null'),
+        "endkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'{}'),
+        "reduce": 'true',
+    }
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth']),
+        params = payload
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    if len(jsondata['rows']) > 0:
+        unknowns = jsondata['rows'][0]['value']['count']
+    return(unknowns)
+
+def stale_view(host_id, scan_db, scan_id):
+    stale_files = 0
+    url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
+        config['cloudant_account'],
+        scan_db,
+        scandb_views['stale_files'][0],
+        scandb_views['stale_files'][1]
+    )
+    payload = {
+        "startkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'null'),
+        "endkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'{}'),
+        "reduce": 'true',
+    }
+    response = requests.get(
+        url,
+        auth = (config['cloudant_user'], config['cloudant_auth']),
+        params = payload
+    )
+    if response.status_code in (201,200,202):
+        jsondata = response.json()
+    else:
+        response.raise_for_status()
+        sys.exit("Bad http request")
+    if len(jsondata['rows']) > 0:
+        stale_files = jsondata['rows'][0]['value']['count']
     return(stale_files)
 
-def orphan_view(scan_db,scan_id):
+def orphan_view(host_id,scan_db,scan_id):
     orphaned_files = 0
     url = "https://{0}.cloudant.com/{1}/{2}/_view/{3}".format(
         config['cloudant_account'],
         scan_db,
-        scandb_views['target_scanned'][0],
-        scandb_views['target_scanned'][1]
+        scandb_views['orphaned_files'][0],
+        scandb_views['orphaned_files'][1]
     )
     payload = {
-        "startkey": '["'+scan_id+'","yes"]',
-        "endkey": '["'+scan_id+'","yes"]',
-        "group_level": 2,
+        "startkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'null'),
+        "endkey": '["{0}","{1}",{2}]'.format(host_id,scan_id,'{}'),
         "reduce": 'true',
     }
     response = requests.get(
@@ -408,6 +624,46 @@ def files_scanned(scan_database, scan_id, host_id):
             sumsqr = 0
         )
         return (zeroes)
+    
+def files_scanned_new(scan_db, scan_id, host_id): #Still broken due to cloudant-python "group_level" bug
+    ddoc = scandb_views['file_types'][0]
+    view = scandb_views['file_types'][1]
+    stats = dict()
+    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
+        db = client[scan_db]
+        result = db.get_view_result(
+            ddoc,
+            view,
+            group_level=2,
+            reduce=True
+        )
+        stats = result[[host_id,scan_id,None]:[host_id,scan_id,{}]]
+    if len(stats) > 0:
+        return stats
+    else:
+        zeroes = dict(
+            sum = 0,
+            count = 0,
+            min = 0,
+            max = 0,
+            sumsqr = 0
+        )
+        return zeroes
+
+def scanning_errors_new(scan_db, scan_id): #Still broken due to cloudant-python "group_level" bug
+    errors = 0
+    ddoc = scandb_views['problem_files'][0]
+    view = scandb_views['problem_files'][1]
+    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
+        db = client[scan_db]
+        result = db.get_view_result(
+            ddoc,
+            view,
+            reduce=True,
+            group_level=1
+            )
+        errors = result[[scan_id,None,None]:[scan_id,{},{}]]['value']
+    return errors
 
 def scanning_errors(scan_db, scan_id):
     errors = 0
@@ -443,7 +699,7 @@ def data_size_pretty(size):
     while (size > 1024):
         size = round(size / 1024, 2)
         measure = measure + 1
-    codes = ['',' KB',' MB',' GB',' TB',' PB']
+    codes = [' bytes',' KB',' MB',' GB',' TB',' PB']
     formattedsize = "{:,}".format(size)
     return (formattedsize + codes[measure])
 
@@ -478,5 +734,4 @@ def orphan_view_cp(scandb,scan_id):
     return (result)
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
-    # a
+    main()

@@ -2,13 +2,12 @@
 
 # Prep
 import json
-import getopt
-#from getopt import GetoptError
 import base64
 import sys
 import hashlib
 import time
-import datetime
+import re
+from datetime import datetime
 from cloudant.account import Cloudant
 from cloudant.design_document import DesignDocument
 from cloudant.result import Result
@@ -18,6 +17,8 @@ from cloudant import cloudant
 import getpass
 import os
 import logging
+import argparse
+import requests # Still needed for a few specific Cloudant queries.
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -36,10 +37,6 @@ config = dict(
     cloudant_user = '',
     # Cloudant password
     cloudant_auth = '',
-    # Slot for base64 auth string (Not currently used)
-    # cloudant_auth_string = '',
-    # Help string printed if invalid options or '-h' used
-    help_text = "Usage: dirscan.py [-c <configfile>] [-u] [-x <excludes_file>] [-v]",
     # Verbose setting (Default is off)
     be_verbose = False,
     # ID of the relationship for this sync (Cloudant doc _id)
@@ -71,8 +68,11 @@ config = dict(
     db_rollover = 2592000,
     # Time threshold to retain older scan databases for in seconds (default is 90 days)
     db_max_age = 7776000,
-    # Setting to use for logging level.  Recommend no higher than INFO unless actually debugging
-    log_level = logging.INFO
+    # Version number of the views in use by this script
+    viewversion = 0.03,
+    # Maximum number of keys to post to a view (for URI length limitation controls)
+    # This can be increased once Cloudant-Python Issue #90 is resolved
+    post_threshold = 100
 )
 
 # Views in main database
@@ -94,17 +94,12 @@ maindb_views = dict(
 
 # Views in each per-diem file scan dbs
 # Format is <view> = [<ddocname>,<viewname>,<mapfunction>,<reducefunction>]
+# MAKE SURE DDOC NAME INCLUDES LEADING "_design/"!
 scandb_views = dict(
     file_types = [
         '_design/files',
         'typesscanned',
         'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
-        '_stats'
-    ],
-    target_scanned = [
-        '_design/scanresults',
-        'targetfiles',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false) {emit([doc.scanID, doc.orphaned, doc.stale], doc.size);}}',
         '_stats'
     ],
     problem_files = [ 
@@ -116,91 +111,196 @@ scandb_views = dict(
     source_files = [
         '_design/sourcefiles',
         'sourcefiles',
-        'function (doc) { if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc.id, doc.datemodified); }}',
+        'function (doc) { if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc._id, doc.datemodified); }}',
+        None
+    ],
+    uptodate_files = [
+        '_design/syncstate',
+        'uptodate',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "no" && (doc.datemodified >= doc.sourcemodified)) {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    stale_files = [
+        '_design/syncstate',
+        'stale',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "no" && (doc.datemodified < doc.sourcemodified)) {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    orphaned_files = [
+        '_design/syncstate',
+        'orphaned',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "yes") {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    unknown_files = [
+        '_design/syncstate',
+        'unknown',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === false && doc.orphaned === "unknown") {emit([doc.host, doc.scanID, doc.datemodified],doc.size);}}',
+        '_stats'
+    ],
+    source_prefixes = [
+        '_design/sourcefiles',
+        'prefixes',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true && doc.source === true) {emit(doc.IDprefix,doc.datemodified);}}',
+        '_count'
+    ],
+    missing_files = [
+        '_design/syncstate',
+        'missing',
+        'function (doc) {if (doc.type === "file") {emit([doc.syncpath,doc.name,doc.host],doc.size);}}',
+        '_stats'
+    ]
+)
+
+# Search design documents
+search_indexes = dict(
+    files = [
+        '_design/search',
+        'files',
+        'function (doc) { index("name", doc.name, "store": true); index("path", doc.path);}',
         None
     ]
 )
 
 # Main execution code
-def main(argv):
-    # Enable warning logs
+def main():
+    
+    # New argument processing section
+    logging_levels = dict(
+        CRITICAL = 50,
+        ERROR = 40,
+        WARNING = 30,
+        INFO = 20,
+        DEBUG = 10,
+    )
+    argparser = argparse.ArgumentParser(description = 'Directory scan tool for rsync-checkpoint')
+    argparser.add_argument(
+        '-c',
+        dest='config',
+        metavar='config file',
+        type=str,
+        nargs='?',
+        help='Configuration file to use for scan operation. Defaults to trying ./{0}'.format(config['default_config_filename']),
+        default = config['default_config_filename']
+        )
+    argparser.add_argument(
+        '-v',
+        action='store_true',
+        help='Be verbose during operation'
+        )
+    argparser.add_argument(
+        '-x',
+        metavar='file',
+        type=file,
+        nargs='?',
+        help='During setup, include a file which lists all directories or files to ignore during scan'
+        )
+    argparser.add_argument(
+        '-u',
+        action='store_true',
+        help='Update an existing configuration'
+        ) # Right now, this does nothing
+    argparser.add_argument(
+        '-l',
+        metavar='logging level',
+        choices=logging_levels,
+        nargs = '?',
+        help = 'Level of logging to the local log file during scan operation. Defaults to WARNING',
+        default = 'WARNING',
+        type=str
+        )
+    argparser.add_argument(
+        '--check',
+        action='store_true',
+        help='Output a summary of the current configuration, check the views for completeness, and exit'
+        )
+    myargs = argparser.parse_args()
+    config['be_verbose'] = myargs.v
+    
+    # Input any excludes for this scan, if passed during configuration stage
+    if myargs.x != None:
+        for exclude in myargs.x:
+            if exclude.isspace():
+                continue
+            else:
+                config['rsync_excluded'].append(exclude)
+        myargs.x.close()
+        
+    # Setup logging
     try:
-        logging.basicConfig(filename='dirsync_errorlog.txt', level=config['log_level'])
+        logging.basicConfig(filename='dirscan_log.txt', level=logging_levels[myargs.l])
         logging.captureWarnings(True)
     except Exception:
-        sys.exit("Can't open local log file.")
+        sys.exit("Can't open local log file, exiting.")
     
-    # Check options for validity, print help if user fat-fingered anything
-    try:
-        opts, args = getopt.getopt(argv,"hc:x:uv")
-    except getopt.GetoptError:
-        print config['help_text']
-        sys.exit(2)
-    
-    # Process passed options
-    for opt, arg in opts:
-        if opt == '-h':
-            print help
-            sys.exit()
-        elif opt in ("-c"):
-            if len(arg) < 6:
-                sys.exit(config['help_text'])
-            config['passed_config_file'] = arg
-        elif opt in ("-u"):
-            # This doesn't do anything yet
-            # Eventually meant to be the parameter for an update to existing configuration
-            update = 1
-        elif opt in ("-v"):
-            config['be_verbose'] = True
-        elif opt in ("-x"):
-            if len(arg) < 1:
-                sys.exit(config['help_text'])
-            get_excludes(arg)
-    
-    # If config file is specfied, read it in and execute scan
-    if (len(config['passed_config_file']) > 0):
-        scanstarttime = datetime.datetime.utcnow().isoformat(' ')        
-        logging.info("Scan started at " + scanstarttime + " UTC")
-        
+    # If config file exists, read it in and execute scan
+    if (os.path.exists(myargs.config)):            
         # Load configuration settings from file
         if (config['be_verbose']):
-            print "Loading " + config['passed_config_file']
-        load_config(config['passed_config_file'])
-        
-        # Initiate scan
+            print "Loading " + myargs.config
+        load_config(myargs.config)
         logging.debug(json.dumps(config, sort_keys=True, indent=4, separators=(',', ': ')))
-
-        if config['be_verbose'] == True:
-            print "Initiating scan now..."
-        completion = directory_scan()
-        scanfinishtime = datetime.datetime.utcnow().isoformat(' ')
-        # Log scan completion status
-        if (completion):
-            logging.info("Scan successfully completed at: " + scanfinishtime + " UTC")
-            if config['be_verbose'] == True:
-                print "Scan successfully completed at " + scanfinishtime
+        logging.info("Reading in configuration file: {0}".format(myargs.config))
+        
+        if myargs.check:
+            config_check()
         else:
+            # Initiate scan
+            scanstarttime = datetime.utcnow().isoformat(' ')
+            scanstartraw = time.time()
+            logging.info("Scan started at " + scanstarttime + " UTC")
             if config['be_verbose'] == True:
-                print "Scan completed with errors at " + scanfinishtime
-            logging.warn("Scan completed with errors at: " + scanfinishtime + " UTC")
+                print "Initiating scan now..."
+            completion = directory_scan()
+            scanfinishtime = datetime.utcnow().isoformat(' ')
+            scanfinishraw = time.time()
+            # Log scan completion status
+            if (completion != False):
+                logging.info("Scan successfully completed at: " + scanfinishtime + " UTC")
+                speed = round(completion  / ((scanfinishraw - scanstartraw) / float(60)),1)
+                logging.info("Rate of scan: {0} files per minute".format(speed))
+                if config['be_verbose'] == True:
+                    print "Scan successfully completed at " + scanfinishtime
+            else:
+                if config['be_verbose'] == True:
+                    print "Scan completed with errors at " + scanfinishtime
+                logging.warn("Scan completed with errors at: " + scanfinishtime + " UTC")
         
         # We're done here
         sys.exit()
 
-    # If no configuration file is passed, ask to run initialization process
+    # If configuration file doesn't exist, run setup process
     else:
-        newfile = raw_input("No configuration file specified. Create? (Y/N) > ")
-        if (newfile in ('y','Y')):
-            create_initial_config()
-        else:
-            print "Exiting..."
-            sys.exit()
+        create_initial_config(myargs.config)
+
+# Check current configuration and database status and output to screen (Future)
+def config_check():
+    from pprint import pprint
+    from progressbar import ProgressBar
+    pprint(config)
+    # Initialize Cloudant connection
+    try:
+        client = Cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account'])
+        client.connect()
+    except Exception:
+        logging.fatal("Unable to connect to Cloudant")
+        sys.exit(" Can't open Cloudant connection")
+    if raw_input(" Update any out-of-date views to version {0}?".format(config['viewversion'])) in ('y','Y'):
+        dblist = client.all_dbs()
+        pbar = ProgressBar()
+        for db in pbar(dblist):
+            if db == 'rsynccheckpoint':
+                check_views(db, client, maindb_views)
+            elif db[:7] == 'scandb-':
+                check_views(db, client, scandb_views)
+    client.disconnect()
 
 # Assemble and write the JSON-formatted configuration file for the host we're running on
-def create_initial_config():
+def create_initial_config(config_file):
     # Initialize Cloudant client instance and obtain user credentials
     auth_not_set = True
     while (auth_not_set):
+        print " The configuration file {0} cannot be found. Creating a new configuration.".format(config_file)
         print " You will need a Cloudant account to use this script."
         print " Go to www.cloudant.com to create one if you don't have it yet."
         print " Enter Cloudant account name (DNS name before .cloudant.com):"
@@ -224,10 +324,11 @@ def create_initial_config():
         # Open existing database
         maindb = client[config['main_db_name']]
         if config['be_verbose'] == True:
-            print " Database found"
+            print " Main scan database found"
+        logging.debug("{0} found".format(config['main_db_name']))
         
     except Exception:
-        
+        logging.info("Creating {0}".format(config['main_db_name']))
         # Create database if it doesn't exist
         maindb = client.create_database(config['main_db_name'])
         if config['be_verbose'] == True:
@@ -267,14 +368,15 @@ def create_initial_config():
                 # Set relationship to active
                 reldoc['active'] = True
                 print "Both hosts are now set up for this relationship!"
-                print "To initiate a scan, use 'dirscan.py -c /path/to/" + config['default_config_filename'] + "'"
+                print "To initiate a scan, use 'dirscan.py -c /path/to/" + config_file + "'"
                     
     else:
         # Have the user set up a new relationship then 
         relationshipdocID = create_new_relationship(maindb)
         
         # Choose the relationship automatically and run host setup
-        create_host_entry(maindb, relationshipdocID)
+        config_file_dict = create_host_entry(maindb, relationshipdocID)
+        write_config_file(config_file_dict, config_file)
         
         print " Now run this setup on the other host."
     client.disconnect()
@@ -325,11 +427,11 @@ def create_host_entry(db, relationshipdocID):
     # Add a trailing slash if one is not present in the user input for path consistency
     if (this_host_directory[len(this_host_directory)-1] != "/"):
         this_host_directory = this_host_directory + "/"
-    # TO-DO: Validate path exists
-    # validate_path(this_host_directory)
+    # Validate path exists
+    if os.path.exists(this_host_directory) != True:
+        sys.exit("Invalid path, try again.")
     
     # Create the new host document in the database and get it's ID
-    # TO-DO: CHECK TO SEE IF I CAN DO THIS WITH A DICT INSERT
     hostdoc = Document(db)
     hostdoc.create()
     hostdoc['type'] = 'host'
@@ -368,22 +470,25 @@ def create_host_entry(db, relationshipdocID):
         host_id = new_host_ID,
         threshold = config['doc_threshold']
     )
-
-    # Write host's config file to disk
-    write_config_file(config_file_content)
-
+    
+    return config_file_content
+    
 # Write a JSON-formatted file with the passed configuration settings
-def write_config_file(config_dict):
-    # config_json = json.dump(config_dict)
+def write_config_file(config_dict, filename):
+    if os.path.exists(filename):
+        overwrite = raw_input(" Existing configuration file found! Overwrite? (Y/N) ")
+        if overwrite in ('n', 'N'):
+            # IMPROVEMENT: Make an undo function for changes in database
+            sys.exit(" Exiting")
     try:
-        data = open(config['default_config_filename'], 'w')
+        data = open(filename, 'w')
     except IOError as e:
         print "I/O error({0}): {1}".format(e.errno, e.strerror)
         sys.exit(2)
     json.dump(config_dict, data)
     data.close()
-    print " " + config['default_config_filename'] +" written."
-    print " This file contains your Cloudant authentication hash, so be sure to secure it appropriately!"
+    print " " + filename +" written."
+    print " This file contains your Cloudant authentication information, so be sure to secure it appropriately!"
 
 # Load configuration from file and database into configuration dictionary
 def load_config(config_file):
@@ -494,6 +599,13 @@ def directory_scan():
         
         # Populate scandb views
         populate_views(new_scan_db, scandb_views)
+        
+        # insert viewversion document
+        versiondoc = Document(new_scan_db,document_id="scanversion")
+        versiondoc.create()
+        versiondoc['current'] = config['viewversion']
+        versiondoc['history']= []
+        versiondoc.save()
                 
         # Set database name for this_scan
         this_scan['database'] = new_scan_db_name
@@ -552,13 +664,13 @@ def directory_scan():
                 
             # Else if the other host has begun a scan, and the selected database is older than 30 days
             if ((currenttime - int(db_logic['other_host_last_scan_DB'][7:])) >= config['db_rollover']):
-                logging.debug("Previous scan DB too old.")
+                logging.info("Previous scan DB too old.")
                 # Create a new database
                 new_scan_db()
                 
             # If the other host is using an older DB, set the flag and open it
             if (this_scan['database'] != db_logic['other_host_last_scan_DB']):
-                logging.debug("Databases are skewed, setting older_scandb value")
+                logging.info("Databases are skewed, setting older_scandb value")
                 db_logic['db_skew'] = True
                 db_logic['older_scandb'] = client[db_logic['other_host_last_scan_DB']]
             else:
@@ -566,17 +678,17 @@ def directory_scan():
                 
         # Else If there is no prior scan for either host
         elif (not this_host_scanned and not other_host_scanned):
-            logging.debug("Neither host has been scanned previously")
+            logging.info("Neither host has been scanned previously")
             # create a new database
             new_scan_db()
         
         # Else if there is a local scan, but not a remote scan
         elif (this_host_scanned and not other_host_scanned):
-            logging.debug("This host has been scanned, but the other hasn't yet.")
+            logging.info("This host has been scanned, but the other hasn't yet.")
             logging.debug("DB time: " + db_logic['last_scan_DB'][7:] + " Current time: " + str(currenttime))
             # If selected DB is older than 30 days
             if (currenttime - int(db_logic['last_scan_DB'][7:]) >= config['db_rollover']):
-                logging.debug("Previous scan DB too old.")
+                logging.info("Previous scan DB too old.")
                 new_scan_db()
             else:
                 this_scan['database'] = db_logic['last_scan_DB']
@@ -592,13 +704,19 @@ def directory_scan():
     # Run the database selection logic to determine the scan database to use and create it if needed
     db_logic = scan_db_selection(maindb)
         
+    if db_logic['other_host_scanned'] == True:
+        config['other_host_last_scan_complete'] = db_logic['other_host_last_scan_complete']
+        
     # Open the selected scan database. If it was somehow accidentally deleted, create a new one of the same name
     try:
         scandb = client[this_scan['database']]
     except:
-        logging.error("Scan db " + this_scan['database'] + " can't be found in Cloudant.")
+        logging.error("Scan db " + this_scan['database'] + " can't be found in Cloudant. Creating a replacement.")
         new_scan_db()
         scandb = client[this_scan['database']]
+    
+    # Check scan DB version
+    #check_views(this_scan['database'],client,scandb_views)
         
     # Create new scan document from this_scan dictionary and keep open for duration of scan
     scandoc = maindb.create_document(this_scan)
@@ -607,135 +725,11 @@ def directory_scan():
     # Total files scanned counter
     this_scan['filecount'] = 0
         
-    # Dictionary of document dictionaries scanned
-    file_doc_batch = []
-        
     if config['be_verbose'] == True:
         print "Beginning filesystem scan"
         
     # HEAVY SCAN OPERATION BEGINS HERE
-    # Iterate through directory structure
-    for root, dirs, files in os.walk(this_scan['directory'], topdown=False):
-        # Prune any skipped files and directories from excludes list
-        dirs[:] = [d for d in dirs if d not in config['rsync_excluded']]
-        files[:] = [d for d in files if d not in config['rsync_excluded']]
-        
-        for name in files:
-            # Iterate counter for scan
-            this_scan['filecount'] = this_scan['filecount'] + 1
-            filedict = dict()
-            
-            # Obtain base file information and store into dict
-            # Set all defaults
-            filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), this_scan['directory'], this_scan['started'])
-            filedict['name'] = name
-            filedict['scanID'] = scandoc['_id']
-            filedict['host'] = config['host_id']
-            filedict['relationship'] = config['relationship']
-            filedict['path'] = root
-            filedict['datescanned'] = 0
-            filedict['size'] = 0
-            filedict['permissionsUNIX'] = 0
-            filedict['datemodified'] = 0
-            filedict['owner'] = 0
-            filedict['group'] = 0
-            filedict['goodscan'] = False
-            filedict['source'] = True
-            filedict['type'] = "file"
-            
-            # Obtain detailed stats on file from OS if possible
-            try:
-                stat = os.stat(os.path.join(root,name))
-                filedict['datescanned'] = int(time.time())
-                filedict['size'] = stat.st_size
-                filedict['permissionsUNIX'] = stat.st_mode
-                filedict['datemodified'] = stat.st_mtime
-                filedict['owner'] = stat.st_uid
-                filedict['group'] = stat.st_gid
-                filedict['goodscan'] = True
-                this_scan['directorysize'] = this_scan['directorysize'] + filedict['size']
-                if (config['ultra_scan'] == True):
-                    filedict['checksum'] = compute_file_hash(os.path.join(root,name))
-            except OSError as e:
-                # Store as bad scan of file and iterate errors
-                this_scan['errorcount'] = this_scan['errorcount'] + 1
-                logging.warn("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
-
-            if (config['is_source']):
-                # We're done scanning this file.  Put it into the array.
-                file_doc_batch.append(filedict)
-
-            else:
-                # We're on a target host, so we aren't finished yet.
-                filedict['source'] = False
-                
-                # Check for source file scanned in database 
-                # Passing a zero to ignore the timestamp and return only the unique file hash
-                source_id_hash = get_file_id(config['other_host_id'], os.path.join(root,name), this_scan['directory'], 0)
-                
-                logging.debug("other host ID: " + config['other_host_id'])
-                logging.debug("file path: " + os.path.join(root,name))
-                logging.debug("source_id_hash: " + source_id_hash)
-                
-                if db_logic['db_skew']:
-                    source_file = db_logic['older_scandb'].all_docs(descending=True, endkey=source_id_hash, startkey=source_id_hash + str(99999999999999999999), limit=1, include_docs=True)['rows']
-                else:
-                    source_file = scandb.all_docs(descending=True, endkey=source_id_hash, startkey=source_id_hash + str(99999999999999999999), limit=1, include_docs=True)['rows']
-                
-                # If file has been scanned:
-                if len(source_file) > 0:
-                    logging.debug("Source file scanned on other host: YES")
-                    # Get the file's Scan timestamp from it's ID
-                    sfst = source_file[0]['id'][40:]
-                    source_file_scan_time = int(sfst)
-                    
-                    # If the file scan timestamp is >= last successful scan date
-                    if (source_file_scan_time >= db_logic['other_host_last_scan_complete']):
-                        # It's not orphaned
-                        filedict['orphaned'] = 'no'
-
-                        # But to determine if it's stale, check the scanned file's modified date against the most recent source version.
-                        thisview = scandb_views['source_files']
-                        if db_logic['db_skew']:
-                            result = db_logic['older_scandb'].get_view_raw_result(thisview[0],thisview[1], key=source_file[0]['id'])['rows']
-                        else:
-                            result = scandb.get_view_raw_result(thisview[0],thisview[1], key=source_file[0]['id'])['rows']
-                        
-                        if (len(result) > 0 and result[0]['value'] > filedict['datemodified']):
-                            # If source is newer,
-                            # In future, this may also include if the latest source scan is older than a configured age threshold
-                            filedict['stale'] = True
-                        else:
-                            # If source is same or older age, it's up-to-date
-                            filedict['stale'] = False
-    
-                    # Else if the timestamp is < last successful completed scan ID for host
-                    # File is orphaned and automatically stale
-                    else:
-                        filedict['orphaned'] = 'yes'
-                        filedict['stale'] = True
-
-                # If the file hasn't ever been scanned on the source we don't know what it's status is
-                else:
-                    logging.debug("Source file scanned on other host: NO")
-                    filedict['orphaned'] = "unknown"
-                    filedict['stale'] = False
-                
-                # Finished, add to array
-                file_doc_batch.append(filedict)
-                                            
-        # If we're at _bulk_docs threshold
-        if ((this_scan['filecount'] > 1) and (int(this_scan['filecount']) / int(config['doc_threshold']) == int(this_scan['filecount']) / float(config['doc_threshold']))):
-            # write batch to database
-            scandb.bulk_docs(file_doc_batch)
-            # flush batch array
-            file_doc_batch = []
-
-    # Insert any remaining documents below the threshold
-    if len(file_doc_batch) > 0:
-        scandb.bulk_docs(file_doc_batch)
-        file_doc_batch = []
-    
+    walk_filesystem(scandb, this_scan, scandoc['_id'])
     # HEAVY SCAN OPERATION ENDS HERE
     
     # Update scan document with final results
@@ -754,29 +748,218 @@ def directory_scan():
         scandoc[thisfield[0]] = thisfield[1]
         
     scandoc.save()
-    logging.info("Scan stats: ")
-    logging.info(json.dumps(updates, sort_keys=True, indent=4, separators=(',', ': ')))
+    logging.debug("Full scan stats: ")
+    logging.debug(json.dumps(updates, sort_keys=True, indent=4, separators=(',', ': ')))
     
     # Now that this scan is complete, wipe out any expired databases
     purge_old_dbs(client)
     
     # Close database out
     client.disconnect()
+    if this_scan['success'] == True:
+        return(this_scan['filecount'])
+    else:
+        return(False)
+
+# Remove local filesystem path prefix to sync directory
+def trim_path(fullpath, is_source):
+    if is_source == True:
+        return(re.sub('^{0}'.format(config['rsync_source_dir']),'',fullpath))
+    else:
+        return(re.sub('^{0}'.format(config['rsync_target_dir']),'',fullpath))
+
+# The "Heavy" operation which iterates through the specified path and updates the database appropriately
+def walk_filesystem(scandb, scandict, scanID):
+
+    # List of document dictionaries scanned
+    file_doc_batch = []
+    # Dictionary of files on a target system to be deeper analyzed
+    stale_analysis_files = dict()
     
-    return(this_scan['success'])
+    # Function that only runs on a target.
+    def stale_analysis(stale_analysis_files):
+        # Dict that gives the target ID for each source ID
+        targetmap = dict()
+        # Dict that stores files to be checked as orphans
+        orphan_check = dict()
+        logging.debug("Running target batch analysis")
+        for targetfileID in stale_analysis_files.keys():
+            # Map the target ID to the source ID and store in target file's dictionary
+            full_path = os.path.join(stale_analysis_files[targetfileID]['path'],stale_analysis_files[targetfileID]['name'])
+            stale_analysis_files[targetfileID]['sourceIDPrefix'] = get_file_id(
+                config['rsync_source'],
+                full_path,
+                config['rsync_target_dir'],
+                0
+            )
+            expected_source_file_ID = stale_analysis_files[targetfileID]['sourceIDPrefix'] + str(config['other_host_last_scan_complete'])
+            targetmap[expected_source_file_ID] = targetfileID
+        
+        # Cover all STALE, and UPTODATE files by locating good recent completed scans of source
+        #ddoc = DesignDocument(scandb, document_id=scandb_views['source_files'][0])
+        #ddoc.fetch()
+        #view = View(ddoc, scandb_views['source_files'][1])
+        logging.debug("Passing list of keys to source_files view")
+        logging.info("Searching for stale and up-to-date files.")
+        sourceFilesResult = scandb.get_view_result(scandb_views['source_files'][0], scandb_views['source_files'][1], keys=targetmap.keys(), reduce=False)
+        logging.debug(sourceFilesResult[:])
+        for row in sourceFilesResult[:]:
+            # Store timestamp of source file into target file dict (for stale check)
+            logging.debug(row)
+            stale_analysis_files[targetmap[row['id']]]['sourcemodified'] = row['value']
+            stale_analysis_files[targetmap[row['id']]]['orphaned'] = 'no'
+            logging.info("File: {0} was scanned on source at: {1}".format(row['id'], datetime.fromtimestamp(row['value']).ctime()))
+            # Remove the doc as finished so we don't alter it further
+            targetmap.pop(row['id'],None)
+        
+        # Cover any ORPHANED files by checking to see if the file was scanned on source but NOT in the most recent completed scan
+        if len(targetmap) > 0:
+            logging.info("Processing any potential orphaned files...")
+            for sourceID in targetmap.keys():
+                # remove timestamp suffixes and put into orphan check dictionary
+                orphan_check[sourceID[:40]] = targetmap[sourceID]
+                logging.info("Checking target: {0} -> against source: {1} ?".format(targetmap[sourceID], sourceID[:40]))
+            # post all suffixes to sourceprefixes view
+            ddoc = DesignDocument(scandb, document_id=scandb_views['source_prefixes'][0])
+            view = View(ddoc, scandb_views['source_prefixes'][1])
+            tempresult = view(keys=orphan_check.keys(), reduce=False)['rows']
+            for row in tempresult:
+                try:
+                    orphanID = orphan_check[row['key']]
+                    logging.info("File: {0} confirmed as orphaned".format(orphanID))
+                    stale_analysis_files[orphanID]['orphaned'] = 'yes'
+                    orphan_check.pop(row['key'], None)
+                except:
+                    continue # This is in place to skip over entries of files that have been already scanned
+        
+        # Cover any UNKNOWN files (which are any remaining after orphan_check)
+        if len(orphan_check) > 0:
+            logging.info("Unknown files found:")
+            for targetID in orphan_check.values():
+                logging.debug("File ID {0}".format(targetID))
+                stale_analysis_files[targetID]['orphaned'] = 'unknown'
+                logging.info("File: {0} in an unknown sync state. No data on source file found".format(targetID))
+            orphan_check.clear()
+        
+        # Write the dictionary of target files to the database
+        target_files = stale_analysis_files.values()
+        scandb.bulk_docs(target_files)
+        # Empty the dictionary
+        stale_analysis_files.clear()
+        
+    # Function that runs regardless of source or target. Fills needed information
+    def local_file_check(filedict, root, name):
+        # Set all default values for the current file's record in the database.
+        # Construct it's custom ID based on the timestamp that the scan began at.
+        prefix = get_file_id(config['host_id'], os.path.join(root,name), scandict['directory'], 0)
+        filedict['_id'] = prefix + str(scandict['started'])
+        filedict['IDprefix'] = prefix
+        filedict['name'] = name
+        filedict['scanID'] = scanID
+        filedict['host'] = config['host_id']
+        filedict['relationship'] = config['relationship']
+        filedict['path'] = root
+        filedict['datescanned'] = int(time.time())
+        filedict['size'] = 0
+        filedict['permissionsUNIX'] = 0
+        filedict['datemodified'] = 0
+        filedict['owner'] = 0
+        filedict['group'] = 0
+        filedict['goodscan'] = False
+        filedict['type'] = "file"
+        #filedict['orphaned'] = False
+        if config['is_source'] == True:
+            filedict['source'] = True
+            filedict['syncpath'] = trim_path(os.path.join(root,name), True)
+        else:
+            filedict['source'] = False
+            filedict['syncpath'] = trim_path(os.path.join(root,name), False)
+        
+        
+        # Obtain detailed stats on file from OS if possible
+        try:
+            stat = os.stat(os.path.join(root,name))
+            #filedict['datescanned'] = int(time.time())
+            filedict['size'] = stat.st_size
+            filedict['permissionsUNIX'] = stat.st_mode
+            filedict['datemodified'] = stat.st_mtime
+            filedict['owner'] = stat.st_uid
+            filedict['group'] = stat.st_gid
+            filedict['goodscan'] = True
+            scandict['directorysize'] = scandict['directorysize'] + filedict['size']
+            if (config['ultra_scan'] == True):
+                filedict['checksum'] = compute_file_checksum(os.path.join(root,name))
+        except OSError as e:
+            # Store as bad scan of file and iterate errors
+            scandict['errorcount'] = scandict['errorcount'] + 1
+            logging.error("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+
+    verbose_counter = 0
+    # Iterate through directory structure
+    for root, dirs, files in os.walk(scandict['directory'], topdown=False):
+        # Prune any skipped files and directories from excludes list
+        dirs[:] = [d for d in dirs if d not in config['rsync_excluded']]
+        files[:] = [d for d in files if d not in config['rsync_excluded']]
+        
+        for name in files:
+            verbose_counter = verbose_counter + 1
+            if (verbose_counter / 100 == float(verbose_counter) / 100 and config['be_verbose'] == True):
+                print " Scanned {0} files...".format(verbose_counter)
+            # Iterate counter for scan
+            scandict['filecount'] = scandict['filecount'] + 1
+            filedict = dict()
+                
+            # run operation for all local files, regardless of source or target
+            local_file_check(filedict, root, name)
+            
+            if (config['is_source']):
+                # Easy. We're done with this file since it's on a source host.
+                # Simply put it into the array for batch insert into the database.
+                file_doc_batch.append(filedict)
+                # If we're at _bulk_docs threshold, write to db and empty the batch array for the next loop.
+                if len(file_doc_batch) >= config['doc_threshold']:
+                    scandb.bulk_docs(file_doc_batch)
+                    file_doc_batch = []
+                    logging.info("Inserted a batch of source files into db")
+            else:
+                # We're on a target host, so we aren't finished yet.
+                # Add file to the dictionary of filedicts to perform stale analysis for and run function if at batch size
+                stale_analysis_files[filedict['_id']] = filedict
+                if len(stale_analysis_files) >= config['post_threshold']:
+                    logging.info("Running stale analysis on a batch of {0} analyzed target files".format(len(stale_analysis_files)))
+                    stale_analysis(stale_analysis_files)
+                else:
+                    # Move on to the next file, doing nothing
+                    logging.debug("nextfile")
+                    continue
+    
+    # *** FILESYSTEM SCAN COMPLETE ***
+    # Insert any remaining documents below the threshold when we're out of files to scan
+    if len(file_doc_batch) > 0:
+        logging.debug("Executing final insertion of {0} files into {1}".format(len(file_doc_batch),scandb))
+        scandb.bulk_docs(file_doc_batch)
+        file_doc_batch = []
+        logging.debug("Final flush of scanned source files to db complete")
+    if len(stale_analysis_files) > 0:
+        logging.debug("Executing final stale analysis of {0} files".format(len(stale_analysis_files)))
+        stale_analysis(stale_analysis_files)
+        logging.debug("Final flush of analyzed target files to db complete")
+    
 
 # Return the unique ID for a file based upon hash and last scan timestamp
-# Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the most recent UTC
+# Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the passed timestamp
 # Removes the passed top_dir in order to make the ID consistent between the hosts when the root path is not the same
+# ^ ID will still not be consistent since the host changes???
 # Returns only the hash if a zero is passed as the timestamp
 def get_file_id(host_id, full_path, top_dir, timestamp):
     # trim the top_dir from the full path
     pathtrim = len(top_dir)
     relative_path = full_path[pathtrim:]
-    logging.debug("Relative file path: " + relative_path)
+    #logging.debug("Relative file path: " + relative_path)
     try:
         f1 = relative_path.decode('utf-8', errors='replace')
         filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest()
+        logging.debug("Hashing input: {0},{1}{2}, {3} Output:{4}".format(host_id,top_dir,full_path,timestamp,filehash))
     except UnicodeDecodeError:
         logging.warn("Path Decode error: " + relative_path)
         filehash = hashlib.sha1(host_id).hexdigest()        
@@ -791,7 +974,7 @@ def get_file_id(host_id, full_path, top_dir, timestamp):
 # Insanely-slow but ultra-effective scanner process that computes an md5 hash of every file it encounters
 # Currently this option is hard-coded to be disabled.
 # I might incorporate it as an option if performance isn't TOO awful
-def compute_file_hash(fname):
+def compute_file_checksum(fname):
     filehash = hashlib.md5()
     with open(fname, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
@@ -881,35 +1064,37 @@ def list_relationships(db):
 
     # Pass back the appropriate relationship document _id
     return relationship_set[int(relationship_selected)]
-
-# Read in the excludes file passed at startup and store to the config array
-def get_excludes(filename):
-    try:
-        data = open(filename)
-    except IOError as e:
-        print "I/O error({0}): {1}".format(e.errno, e.strerror)
-        sys.exit(2)
-    for exclude in data:
-        if exclude.isspace():
-            continue
-        else:
-            config['rsync_excluded'].append(exclude)
     
-# Check for scan databases older than retention threshold and delete them
-# TO-DO: Delete scan dbs without any successful scan documents associated with them and are beyond a certain threshold in number
+# Clean up derelict scan databases in the Cloudant account
 def purge_old_dbs(client):
     dblist = client.all_dbs()
     current_time = int(time.time())
     for db in dblist:
         if 'scandb-' not in db:
             continue
-        else:
+        elif ((current_time - int(db[7:])) > config['db_max_age']):
             # If the extracted timestamp is older than the threshold
-            if ((current_time - int(db[7:])) > config['db_max_age']):
-                logging.info("Deleting out-dated database: " + db)
-                # execute a database delete command
-                doomed_db = Database(client,db)
-                doomed_db.delete()
+            logging.info("Deleting out-dated database: " + db)
+            # execute a database delete command
+            doomed_db = client[db]
+            doomed_db.delete()
+        elif ((current_time - int(db[7:])) > 86400):
+            # If the database is older than one day, and has no documents besides ddocs
+            empty_db = client[db]
+            if empty_db.doc_count() < 10:
+                logging.info("Deleting empty database: " + db)
+                empty_db.delete()
+                
+    # If the database is older than one month, and has no successful completed scans associated with it
+    main_db = client[config['main_db_name']]
+    thisview = maindb_views['recent_scans']
+    result = main_db.get_view_result(thisview[0], thisview[1], reduce=False)
+    for r in result:
+        if (r['value'] in dblist) and (r['key'][1] == False) and (current_time - int(r['value'][7:]) > 2592000):
+            logging.info("Deleting {0} due to no successful scans for one week.".format(r['value']))
+            doomed_db = client[r['value']]
+            doomed_db.delete()
+            dblist.remove(r['value'])
 
 # Insert the passed dictionary of views into the passed database
 # Needs a method for upgrading existing views in case they change with a new version of the script
@@ -937,10 +1122,46 @@ def populate_views(db, viewdict):
                 logging.fatal("Cannot insert design document into scan database: " + view[0])
                 sys.exit("Something has gone wrong. See log for details")
 
-# TO-DO: Utilize bulk calls to check for stale file states en-masse.
-def bulk_stale_check():
-    pass
+# Check database views in database with <dbname> using client <c>, and the set of <views>
+def check_views(dbname, c, views):
+    db = c[dbname]
+    versiondoc = Document(db,document_id="scanversion")
+    if versiondoc.exists() != True:
+        versiondoc.create()
+        versiondoc['current'] = config['viewversion']
+        versiondoc['history']= []
+        versiondoc.save()
+    else:
+        versiondoc.fetch()
+    if versiondoc['current'] < config['viewversion']:
+        # Open each ddoc / view combo for existing
+        for thisview in views.values():
+            ddoc = DesignDocument(db,thisview[0])
+            if ddoc.exists() == False:
+                # Create ddoc and view
+                logging.info("Creating {0}{1}".format(thisview[0],thisview[1]))
+                ddoc = DesignDocument(db, document_id=thisview[0])
+                ddoc.add_view(thisview[1], thisview[2], reduce_func = thisview[3])
+                ddoc.save()
+            else:
+                # doc exists, check view
+                ddoc.fetch()
+                oldview = ddoc.get_view(thisview[1])
+                # if view not there
+                if oldview == None:
+                    # insert it
+                    logging.info("Inserting {1} into {0}".format(thisview[0],thisview[1]))
+                    ddoc.add_view(thisview[1],thisview[2],thisview[3])
+                    ddoc.save()
+                # if view function is different
+                elif (oldview['map'] != thisview[2]):
+                    # Update
+                    logging.info("Updating {0}{1}".format(thisview[0],thisview[1]))
+                    ddoc.update_view(thisview[1],thisview[2],thisview[3])
+                    ddoc.save()
+                else:
+                    continue
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
 

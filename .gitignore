@@ -1,2 +1,3 @@
 *.json
 *.txt
+*_temp.py

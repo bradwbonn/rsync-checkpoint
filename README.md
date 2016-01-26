@@ -1,11 +1,11 @@
-# rsync-checkpoint
+# rsync-checkpoint 0.03
 When setting up two systems to have a replica filesystem using `rsync`, I often find it hard to get a reliable view of how well-synchronized the two systems are.  
 
 Rsync will happily continue going in whatever operation you set up, but if it's only putting placeholders or skipping over files it can't read, you won't know until you need those copied files or manually go through and check the integrity of them all from time to time.
 
 This is a combination python scanning script, command line tool, and eventually will include a Node.js visualization program to show how closely up-to-date two directories are to one another.  The scanner script runs independently on each host, and uses Cloudant DBaaS  as the means by which each host provide updates about their local filesystem's contents.
 
-The python scripts all utilize the cloudant-python beta (2.0.0a4) library, available from:
+The python scripts all utilize the cloudant-python beta (2.0.0b1) library, available from:
 
 	pip install --pre cloudant
 	
@@ -16,7 +16,7 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * synccheck.py - script to view the status of an rsync relationship, either during or after scans by dirscan.py
 
 
-#### Example local configuration file (JSON format)
+#### Example generated configuration file (JSON format)
 
 	{
 		‘cloudant_auth’: <Cloudant password>,
@@ -40,10 +40,9 @@ The deprecated (0.5.10) cloudant python library will not work with these scripts
 * The output will show the current state of the two replica filesystems with one another, accounting for any ignored files or paths. Passing `-r` causes the script to continuously update the status every `<minutes>`.
     
 ## Known Issues/Limitations:
-* Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them
+* Currently only supports one relationship per host pair per direction. Each relationship will be for two hosts and one direction between them on each configuration file.  In order to support multiple sync relationships, simply create a new config file for each relationship on each host, and run the tasks separately, passing the appropriate configuration file.
 * An existing relationship cannot be modified using the script. For now, delete the configuration file on each host and create new ones.
-* Input validation needed for numerous user-entry fields
 * Currently only 10 relationships are supported per account
 * IPv6 not supported yet
 * Non-unicode character path names are not supported at this time.
-* I recommend using a lock file wrapper on the cron task until one is implemented in-script to avoid concurrent local scans
+* I recommend using a lock file wrapper on the cron task until one is implemented in-script to avoid concurrent local scans to minimize system load
