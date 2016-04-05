@@ -384,7 +384,7 @@ def get_view(db,ddoc,view,reduce,group_level,startkey,endkey,include_docs):
 
 # Output a formatted date/time from UTC timestamp
 def pretty_time(timestamp):
-    return (datetime.fromtimestamp(timestamp).ctime())
+    return (datetime.fromtimestamp(int(timestamp)).ctime())
 
 def check_relationship():
     # Source is always first in each array, target is always second
