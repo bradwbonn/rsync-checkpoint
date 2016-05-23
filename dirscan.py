@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 
-# Outstanding 0.04 issues:
-# * Search for previous versions based on prefix
-# * Implement CQ index for synccheck.py usage
-# * Handle situations where sometimes a robust scan is run, and sometimes not
-# * Problems with exception list possibly ignoring more/less than it should
+# Known issues:
+# * Files that are moved, then altered between scans will be marked as deleted in their old location
+
+# to-do:
+# * switch check_existing() to use Cloudant lib
+# * Verify check_excluded() is working properly because it's probably not
 
 # Possible status values based on current code:
 # status: {'state': 'error', 'detail': 'error reason'}
@@ -15,16 +16,25 @@
 
 # Prep
 import json, base64, sys, hashlib, time, re
+import os, logging, argparse
+
 from datetime import datetime
-from cloudant.account import Cloudant
+from cloudant.client import Cloudant
 from cloudant.design_document import DesignDocument
 from cloudant.result import Result
 from cloudant.document import Document
-from cloudant.views import View
+from cloudant.view import View
 from cloudant import cloudant
-import os, logging, argparse
-import requests # Still needed for a few specific Cloudant queries.
 
+import requests # Still needed for a few specific Cloudant queries. Hopefully not for long
+
+logging_levels = dict(
+        CRITICAL = 50,
+        ERROR = 40,
+        WARNING = 30,
+        INFO = 20,
+        DEBUG = 10,
+    )
 
 config = dict(
     # Name of database in Cloudant for everything except file entries
@@ -78,7 +88,7 @@ config = dict(
     viewversion = 0.04,
     # Maximum number of keys to post to a view (for URI length limitation controls)
     # This can be increased once Cloudant-Python Issue #90 is resolved
-    post_threshold = 100
+    post_threshold = 2000
 )
 
 # Views in main database
@@ -190,88 +200,20 @@ scan_index = dict(
 # Main execution code
 def main():
     
-    # New argument processing section
-    logging_levels = dict(
-        CRITICAL = 50,
-        ERROR = 40,
-        WARNING = 30,
-        INFO = 20,
-        DEBUG = 10,
-    )
-    argparser = argparse.ArgumentParser(description = 'Directory scan tool for rsync-checkpoint')
-    group = argparser.add_mutually_exclusive_group()
-    argparser.add_argument(
-        '-c',
-        dest='config',
-        metavar='config file',
-        type=str,
-        nargs='?',
-        help='Configuration file to use for scan operation. Defaults to trying ./{0}'.format(config['default_config_filename']),
-        default = config['default_config_filename']
-        )
-    argparser.add_argument(
-        '-v',
-        action='store_true',
-        help='Be verbose during operation'
-        )
-    argparser.add_argument(
-        '-x',
-        metavar='file',
-        type=file,
-        nargs='?',
-        help='During setup, include a file which lists all directories or files to ignore during scan'
-        )
-    group.add_argument(
-        '-u',
-        action='store_true',
-        help='Update an existing configuration'
-        ) # Right now, this does nothing
-    argparser.add_argument(
-        '-l',
-        metavar='logging level',
-        choices=logging_levels,
-        nargs = '?',
-        help = 'Level of logging to the local log file during scan operation. Defaults to WARNING',
-        default = 'WARNING',
-        type=str
-        )
-    argparser.add_argument(
-        '--deep',
-        action='store_true',
-        help='Use the file checksum operation during scan for full file completeness and file corruption checking purposes. Note: Much heavier scan operation!'
-        )
-    group.add_argument(
-        '--check',
-        action='store_true',
-        help='Output a summary of the current configuration, check the views for completeness, then exit'
-        )
-    group.add_argument(
-        '--flush',
-        action='store_true',
-        help='Flush any old or stale scan databases from the Cloudant account, then exit.'
-        )
-    myargs = argparser.parse_args()
-    config['be_verbose'] = myargs.v
-    config['ultra_scan'] = myargs.deep
+    # Process command-line settings
+    myargs = get_args()
     
-    # Input any excludes for this scan, if passed during configuration stage
-    if myargs.x != None:
-        for exclude in myargs.x:
-            if exclude.isspace():
-                continue
-            else:
-                config['rsync_excluded'].append(exclude)
-        myargs.x.close()
-        
     # Setup logging
     try:
         logging.basicConfig(filename='dirscan_log.txt', level=logging_levels[myargs.l])
         logging.captureWarnings(True)
+        
     except Exception:
         sys.exit("Can't open local log file, exiting.")
     
     # If config file exists, read it in and execute scan
-    if (os.path.exists(myargs.config)):            
+    if (os.path.exists(myargs.config)):
+        
         # Load configuration settings from file
         ver("Loading " + myargs.config)
         load_config(myargs.config)
@@ -280,29 +222,20 @@ def main():
         
         if myargs.check:
             config_check()
+            
         elif myargs.flush:
             with cloudant(config['cloudant_user'],config['cloudant_auth'],account=config['cloudant_account']) as client:
                 purge_old_dbs(client)
+                
         else:
             # Initiate scan
-            scanstarttime = datetime.utcnow().isoformat(' ')
-            scanstartraw = time.time()
-            logging.info("Scan started at " + scanstarttime + " UTC")
-            ver("Initiating scan now...")
-            completion = directory_scan()
-            scanfinishtime = datetime.utcnow().isoformat(' ')
-            scanfinishraw = time.time()
-            # Log scan completion status
-            if (completion):
-                logging.info("Scan successfully completed at: " + scanfinishtime + " UTC")
-                speed = round(completion  / ((scanfinishraw - scanstartraw) / float(60)),1)
-                logging.info("Rate of scan: {0} files per minute".format(speed))
-                ver("Scan successfully completed at {0} on {1} files.".format(scanfinishtime,completion))
-                ver("Rate of scan: {0} files per minute".format(speed))
-            else:
-                ver("Scan completed with errors at " + scanfinishtime + " UTC")
-                logging.warn("Scan completed with errors at: " + scanfinishtime + " UTC")
-        
+            ver("Initiating scan...")
+            with cloudant(config['cloudant_user'],config['cloudant_auth'],account=config['cloudant_account']) as client:
+                # Create scan object and execute
+                this_scan = FileScan(client, maindb_views, scandb_views, config)
+                elapsed_time = this_scan.run()
+                ver("Scan completed at {0} on {1} files.".format(this_scan.scandoc['ended'],this_scan.scandoc['filecount']))
+
         # We're done here
         sys.exit()
 
@@ -571,15 +504,136 @@ def load_config(config_file):
         config['is_source'] = False
         config['other_host_id'] = config['rsync_source']
 
-# filesystem scan function 
-def directory_scan():
-    # Database creation function
-    def new_scan_db():
+def get_args():
+    # New argument processing section
+
+    argparser = argparse.ArgumentParser(description = 'Directory scan tool for rsync-checkpoint')
+    group = argparser.add_mutually_exclusive_group()
+    argparser.add_argument(
+        '-c',
+        dest='config',
+        metavar='config file',
+        type=str,
+        nargs='?',
+        help='Configuration file to use for scan operation. Defaults to trying ./{0}'.format(config['default_config_filename']),
+        default = config['default_config_filename']
+        )
+    argparser.add_argument(
+        '-v',
+        action='store_true',
+        help='Be verbose during operation'
+        )
+    argparser.add_argument(
+        '-x',
+        metavar='file',
+        type=file,
+        nargs='?',
+        help='During setup, include a file which lists all directories or files to ignore during scan'
+        )
+    group.add_argument(
+        '-u',
+        action='store_true',
+        help='Update an existing configuration'
+        ) # Right now, this does nothing
+    argparser.add_argument(
+        '-l',
+        metavar='logging level',
+        choices=logging_levels,
+        nargs = '?',
+        help = 'Level of logging to the local log file during scan operation. Defaults to WARNING',
+        default = 'WARNING',
+        type=str
+        )
+    argparser.add_argument(
+        '--deep',
+        action='store_true',
+        help='Use the file checksum operation during scan for full file completeness and file corruption checking purposes. Note: Much heavier scan operation!'
+        )
+    group.add_argument(
+        '--check',
+        action='store_true',
+        help='Output a summary of the current configuration, check the views for completeness, then exit'
+        )
+    group.add_argument(
+        '--flush',
+        action='store_true',
+        help='Flush any old or stale scan databases from the Cloudant account, then exit.'
+        )
+    
+    myargs = argparser.parse_args()
+    
+    config['be_verbose'] = myargs.v
+    config['ultra_scan'] = myargs.deep
+    
+    # Input any excludes for this scan, if passed during configuration stage
+    if myargs.x != None:
+        for exclude in myargs.x:
+            if exclude.isspace():
+                continue
+            else:
+                config['rsync_excluded'].append(exclude)
+        myargs.x.close()
+    
+    return myargs
+    
+
+class FileScan(object):
+    
+    def __init__(
+                self,
+                client,
+                maindb_views,
+                scandb_views,
+                config_dict
+            ):
+        
+        # base variables
+        self.file_doc_batch = []
+        self.missing_files = []
+        self.complete = False
+        self.client = client
+        self.maindb_views = maindb_views
+        self.scandb_views = scandb_views
+        self.verbose = config_dict['be_verbose']
+        self.config = config_dict
+        self.speed = 0
+        
+        # Open main and scan databases. Order is important here.
+        self.maindb = client[config_dict['main_db_name']]
+        self.scan_db_name = self.select_scan_db()
+        self.scandb = client[self.scan_db_name]
+        
+        # Initialize the Cloudant DB scan document and values
+        self.scandoc = Document(self.maindb)
+        self.scandoc.create()
+        self.scandoc['started'] = 0
+        self.scandoc['ended'] = 0
+        self.scandoc['firstscan'] = False # Assume not true unless a new DB gets created, in which case definitely true
+        self.scandoc['relationship'] = self.config['relationship']
+        self.scandoc['source'] = self.config['is_source']
+        self.scandoc['filecount'] = 0
+        self.scandoc['errorcount'] = 0
+        self.scandoc['directorysize'] = 0
+        self.scandoc['type'] = 'scan'
+        self.scandoc['success'] = False
+        self.scandoc['hostID'] = self.config['host_id']
+        self.scandoc['previousscanID'] = ''
+        self.scandoc['database'] = self.scan_db_name
+        self.scandoc['deepscan'] = self.config['ultra_scan']
+        if (config['is_source']):
+            self.scandoc['directory'] = self.config['rsync_source_dir']
+        else:
+            self.scandoc['directory'] = self.config['rsync_target_dir']
+        
+        # Save scan document so far and obtain an _id
+        self.scandoc.save()
+    
+    def new_scan_db(self):
         # Create a new scan database for this relationship
         new_scan_db_name = 'scandb-' + str(int(time.time()))
         logging.info("Creating a new database for this scan: " + new_scan_db_name)
         try:
-            new_scan_db = client.create_database(new_scan_db_name)
+            new_scan_db = self.client.create_database(new_scan_db_name)
         except Exception:
             logging.fatal("Cannot create scan database")
             sys.exit("Something has gone wrong. See log for details")
@@ -590,28 +644,26 @@ def directory_scan():
             if (new_scan_db.exists()):
                 wait = False
             else:
-                ver("Waiting for database to become available...")
                 time.sleep(10)
         
         # Populate scandb views
-        check_views(new_scan_db_name, client, scandb_views)
-        insert_search_indexes(new_scan_db_name, client, search_indexes['files'])
+        self.check_views(new_scan_db_name, client, scandb_views)
+        self.insert_search_indexes(new_scan_db_name, client, search_indexes['files'])
         
         # insert viewversion document
         with Document(new_scan_db,document_id="scanversion") as versiondoc:
-            versiondoc['current'] = config['viewversion']
+            versiondoc['current'] = self.config['viewversion']
             versiondoc['history']= []
             
         # Mark this scan as the first on this database
-        scan['firstscan'] = True
+        self.scandoc['firstscan'] = True
         
         # Set database name for this_scan
         return new_scan_db_name
-        
-    # Scan database selection function
-    def scan_db_selection(maindb, client):
-        thisview = maindb_views['recent_scans']
-        result = maindb.get_view_result(thisview[0], thisview[1], reduce=False,descending=True)   
+    
+    def select_scan_db(self):
+        thisview = self.maindb_views['recent_scans']
+        result = self.maindb.get_view_result(thisview[0], thisview[1], reduce=False,descending=True)   
         if result != None:
             logging.debug("Previous scans found")
             lastscan = result[[config['host_id'],{},{}]:[config['host_id'],None,0]]
@@ -624,333 +676,293 @@ def directory_scan():
                 return lastscan[0]['value']
             else:
                 logging.debug("Previous scan not found for either host in the relationship.")
-                return new_scan_db()
+                return self.new_scan_db()
         else:
             logging.debug("Previous scan not found for any host.")
-            return new_scan_db()
-    
-    # SCAN BEGINS HERE    
-    scan_result = False
-    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account']) as client:
-        maindb = client[config['main_db_name']]
-        scan = Document(maindb)
-        scan.create()
-        # initial scan status values
-        scan['started'] = int(time.time())
-        scan['ended'] = 0
-        scan['source'] = config['is_source']
-        scan['type'] = 'scan'
-        scan['success'] = False
-        scan['errorcount'] = 0
-        scan['hostID'] = config['host_id']
-        scan['directorysize'] = 0
-        scan['relationship'] = config['relationship']
-        #scan['firstscan'] = True <- not in use currently
-        scan['previousscanID'] = ''
-        scan['filecount'] = 0
-        scan['firstscan'] = False # Assume not true unless a new DB gets created, in which case definitely true
-        if (config['is_source']):
-            scan['directory'] = config['rsync_source_dir']
-        else:
-            scan['directory'] = config['rsync_target_dir']
-            
-        # Save scan document so far and obtain an _id
-        scan.save()
+            return self.new_scan_db()
         
-        # Find the DB last used by any scan in the relationship and open it, otherwise create a new one
-        scan['database'] = scan_db_selection(maindb, client)
-        try:
-            scandb = client[scan['database']]
-        except:
-            logging.error("Scan db " + scan['database'] + " can't be found in Cloudant. Creating a replacement.")
-            ver("Scan db " + scan['database'] + " can't be found in Cloudant. Creating a replacement.")
-            scan['database'] = new_scan_db()
-            scandb = client[scan['database']]
-            
-        logging.info("Scanning using database: " + scan['database'])
+    def run(self):
         
-        ver("Beginning filesystem scan...")
-        ver("Scan database: {0} Excluding: {1}".format(scan['database'], config['rsync_excluded']))
-            
-        walk_filesystem(scandb, scan)
+        self.scandoc['started'] = int(time.time())
         
+        logging.info("Scanning using database: " + self.scandoc['database'])
+        logging.info("Scan started at " + datetime.utcnow().isoformat(' ') + " UTC")
+        self.ver("Scan database: {0} Excluding: {1}".format(self.scandoc['database'], self.config['rsync_excluded']))
+        
+        # Iterate through filesystem
+        self.sweep()
+        
+        # Process files in DB that are no longer found at their previous locations on the filesystem
+        self.check_missing()
+            
         # Update scan document with final results
-        if scan['errorcount'] == 0:
-            scan['success'] = True
-            scan_result = scan['filecount']
-        else:
-            scan_result = False
-            
-        logging.debug("Full scan stats: ")
-        logging.debug(json.dumps(scan, sort_keys=True, indent=4, separators=(',', ': ')))
+        if self.scandoc['errorcount'] == 0:
+            self.scandoc['success'] = True
+        self.scandoc['ended'] = int(time.time())
         
         # Save scan document    
-        scan.save()
-    
-        return(scan_result)
-
-# Remove local filesystem path prefix to sync directory
-def trim_sync_path(fullpath):
-    if config['is_source'] == True:
-        return(re.sub('^{0}'.format(config['rsync_source_dir']),'',fullpath))
-    else:
-        return(re.sub('^{0}'.format(config['rsync_target_dir']),'',fullpath))
-
-# Obtain local data on file. Returns dictionary
-def get_file_metadata(root, name, scan):
-    filedict = dict()
-    
-    # Get the scan path for the host opposite this one in order to construct the opposite host's file ID prefix
-    if config['is_source'] == True:
-        other_host_scan_dir = config['rsync_target_dir']
-    else:
-        other_host_scan_dir = config['rsync_source_dir']
+        self.scandoc.save()
         
-    # Values stored regardless of OS detail check
-    filedict['IDprefix'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
-    filedict['syncIDprefix'] = get_file_id(config['other_host_id'], os.path.join(root,name), other_host_scan_dir, 0)
-    filedict['name'] = name
-    filedict['scanID'] = scan['_id']
-    filedict['host'] = config['host_id']
-    filedict['relationship'] = config['relationship']
-    filedict['path'] = root
-    filedict['datescanned'] = int(time.time())
-    filedict['type'] = "file"
-    filedict['source'] = config['is_source']
-    filedict['syncpath'] = trim_sync_path(os.path.join(root,name))
-    
-    # Values from detail check
-    try:
-        stat = os.stat(os.path.join(root,name))
-        filedict['size'] = int(stat.st_size)
-        filedict['permissionsUNIX'] = stat.st_mode
-        filedict['datemodified'] = int(stat.st_mtime)
-        filedict['owner'] = stat.st_uid
-        filedict['group'] = stat.st_gid
-        filedict['goodscan'] = True
-        # Construct it's custom ID
-        filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], int(stat.st_mtime))
-        if (config['ultra_scan'] == True):
-            filedict['checksum'] = compute_file_checksum(root,name)
-        # Handle cases where the filename / path can't be properly encoded due to Unicode issues
-        if '-ERROR' in filedict['_id']:
-            filedict['status'] = {'state': 'error', 'detail': 'Path encode error'}
-        else:
-            filedict['status'] = {'state': 'ok', 'detail': None}
+        # Record completion time and speed
+        self.speed = round(self.scandoc['filecount']  / ((self.scandoc['ended'] - self.scandoc['started']) / float(60)),1)
+        logging.info("Rate of scan: {0} files per minute".format(self.speed))
+        logging.debug("Full scan stats: ")
+        logging.debug(json.dumps(self.scandoc, sort_keys=True, indent=4, separators=(',', ': ')))
         
-        # Increment size of directory in scan document
-        scan['directorysize'] = scan['directorysize'] + filedict['size']
-    
-    except OSError as e:
-        # Store as bad scan of file and iterate errors. Also set ID without a timestamp
-        filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
-        scan['errorcount'] = scan['errorcount'] + 1
-        filedict['status'] = {'state': 'error', 'detail': "OS error: {0} {1}".format(e.errno, e.strerror)}
-        logging.error("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
-        ver("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+        self.complete = True
         
-    return filedict
-
-# Process to take a batch of scanned files and push them into the database (if needed)
-def batch_analysis(scandb, files):
-    
-    # If this is the first in the database, don't bother checking anything.
-    # Just insert all the file documents.  (We've just created the database and it's empty)
-    if scan['firstscan'] == True:
-        scandb.bulk_docs(files)
-        return True
-    
-    # Batch insertion holder
-    new_files = []
-    
-    # Make a dictionary of this batch's files (files_dict) to work on by their IDs
-    files_dict = dict()
-    for filedict in files:
-        files_dict[filedict['_id']] = filedict
+        # Return time elapsed
+        return self.scandoc['ended'] - self.scandoc['started']
+  
+    # Check all files in batch against existing DB entries.
+    # Found entries are checked for corruption, then removed from the batch
+    # Corrupted entries in DB updated whenever found
+    def check_existing(self):
         
-    # If the deep scan is enabled, validate checksums against existing files in DB. Otherwise use date/size
-    if config['ultra_scan'] == True:
-        view = scandb_views['checksums']
-    else:
-        view = scandb_views['scanned_files']
+        ids_to_find = dict()
+        for filedict in self.file_doc_batch:
+            ids_to_find[filedict['id']] = filedict
         
-    myurl = 'https://{0}.cloudant.com/{1}/{2}/_view/{3}?reduce=false&include_docs=true'.format(
-        config['cloudant_account'],
-        scandb.metadata()['db_name'],
-        view[0],
-        view[1]
-    )
-
-    # Check for any existing docs based on the full ID of each file.  Uses primary index
-    # Currently using requests library since Cloudant Python cannot support enough keys per GET
-    my_header = {'Content-Type': 'application/json'}
-    r = requests.post(
-        myurl,
-        headers = my_header,
-        auth = (config['cloudant_user'],config['cloudant_auth']),
-        data = json.dumps({ 'keys': files_dict.keys() })
-    )
-    result = r.json()
-
-    # If we've found some matching file IDs, check them for any change in size or checksum
-    if len(result['rows']) > 0:
-        if config['ultra_scan'] == True:
+        # Check for any existing docs based on the full ID of each file.  Uses primary index
+        # Currently using requests library - should be able to use Cloudant library now
+        myurl = 'https://{0}.cloudant.com/{1}/_all_docs?include_docs=true'.format(
+            self.config['cloudant_account'],
+            self.scandb.metadata()['db_name']
+        )
+        my_header = {'Content-Type': 'application/json'}
+        try:
+            r = requests.post(
+                myurl,
+                headers = my_header,
+                auth = (config['cloudant_user'],config['cloudant_auth']),
+                data = json.dumps({ 'keys': ids_to_find })
+            )
+            result = r.json()
+        except Exception as e:
+            logging.fatal("Unable to execute HTTP POST: {0}".format(e))
+            sys.exit("Unable to execute HTTP POST: {0}".format(e))
+        
+        # If the deep scan is enabled, validate checksums against existing files in DB. Otherwise use date/size
+        if self.config['ultra_scan'] == True:
             check_field = 'checksum'
         else:
             check_field = 'size'
+            
+        # If we've found some matching file IDs, check them for any change in size or checksum
+        # The file's ID should be changed if the content has updated because it's tied to the update date.
+        # If it hasn't, there's something likely wrong with the file
         for f in result['rows']:
+            
             # If the contents of the file have changed locally:
-            if f['value'] != files_dict[f['key']][check_field]:
+            if f['doc'][check_field] != ids_to_find[f['key']][check_field]:
+                
                 # Update the existing file document's content details, append a possible corruption warning.
                 now = int(time.time())
-                files_dict.pop(f['key'])
-                #changed_file[check_field] = f['value']
-                #changed_file['error'] = "{0} mismatch without filesystem date change found on {1}. Possible file corruption!".format(check_field, pretty_time(now))
-                #changed_file['status'] = {'state': 'ok', 'detail': 'possibly corrupted'}
                 logging.warning("{0} mismatch from previous scan for {1}".format(check_field,possible_corrupt_file['name']))
-                with Document(scandb, document_id=f['key']) as doc:
+                
+                # Update the document in the database for the file directly.
+                # One DB operation per changed file.
+                # Might be best done in bulk, but first iteration using "easier" method
+                with Document(self.scandb, document_id=f['key']) as doc:
                     doc['error'] = "{0} mismatch without filesystem date change found on {1}. Possible file corruption!".format(check_field, pretty_time(now))
                     doc['status'] = {'state': 'ok', 'detail': 'possibly corrupted'}
                     doc[check_field] = f['value']
-    else:
-        # No existing file IDs have been found.
-        # Search for previous versions based on prefix
-        # UNFINISHED
-        myurl = 'https://{0}.cloudant.com/{1}/{2}/_view/{3}?reduce=false&include_docs=true'.format(
-            config['cloudant_account'],
-            scandb.metadata()['db_name'],
-            view[0],
-            view[1]
-        )
-        
-    # Insert batch
-    if len(new_files) > 0:
-        bulk_result = scandb.bulk_docs(new_files)
-        #ver("Inserted a batch of {0} entries into {1}".format(len(new_files),scandb.metadata()['db_name']))
-        logging.info("Inserted a batch of {0} entries into {1}".format(len(new_files),scandb.metadata()['db_name']))
-        for row in bulk_result:
-            if 'error' in row.keys():
-                logging.error("Couldn't insert {0}: {1}".format(row['id'],row['reason']))
-                ver("ERROR: Couldn't insert {0}: {1}".format(row['id'],row['reason']))
-        
-    # empty out placeholders
-    del new_files[:]
-    files_dict.clear()
+            
+            # Remove file's entry from the batch
+            self.file_doc_batch.remove(f['doc'])
     
-# The "Heavy" operation which iterates through the specified path and updates the database appropriately
-def walk_filesystem(scandb, scan):
-    # List of document dictionaries for insertion into database
-    file_doc_batch = []
-    # List of files from DB not found on local filesystem
-    missing_files = []
-        
-    # Sweep filesystem, storing metadata for each file along the way, executing db batch operation when appropriate
-    for root, dirs, files in os.walk(scan['directory'], topdown=False):
-        for name in files:
-            skip = False
-            for exclude in config['rsync_excluded']: # May have to switch to using a regular expression here**
-                if exclude in os.path.join(root,name):
-                    ver("Skipping excluded file {0}".format(os.path.join(root,name)))
-                    logging.debug("Skipping {0}".format(os.path.join(root,name)))
-                    skip = True
-            if skip == True:
-                continue
-            thisfile = get_file_metadata(root, name, scan)
-            file_doc_batch.append(thisfile)
-            scan['filecount'] = scan['filecount'] + 1
-            if len(file_doc_batch) >= config['doc_threshold']:
-                ver("Scanning... Total files so far: {0}".format(scan['filecount']))
-                batch_analysis(scandb, file_doc_batch)
-                del file_doc_batch[:]
+    # For each missing file, check to see if it exists somewhere else on the host now.
+    # Currently done as one DB operation per file, but this is only for files that have
+    # been moved or deleted, so their frequency will be much less
+    def check_missing(self):
+        for missing_file in self.missing_files:
+            view = self.scandb_views['duplicate_files']
+            result = self.scandb.get_view_result(
+                view[0],
+                view[1],
+                reduce=False
+            )
+            with Document(self.scandb, document_id=missing_file) as doc:
+                bound = [doc.name,doc.datemodified,doc.checksum,doc.size,doc.host]
+                new_location = result[bound:bound]
+                if new_location[0]['id'] != None:
+                    # File has moved.  Set previous doc's status and continue
+                    doc.status = {'state': 'moved', 'detail': new_location[0]['id']}
+                else:
+                    # File is nowhere else in DB. Set as deleted and note time
+                    doc.status = {'state': 'deleted', 'detail': int(time.time())}
+        del self.missing_files[:]
+    
+    def batch_process(self):
+        # If this is the first in the database, don't bother checking anything.
+        # Just insert all the file documents.  (We've just created the database and it's empty)
+        if self.scandoc['firstscan'] == True:
+            self.scandb.bulk_docs(self.file_doc_batch)
+            del self.file_doc_batch[:]
+        # Otherwise, check the files against the database
+        else:
+            self.check_existing()
+            if len(self.file_doc_batch) > 0:
+                self.scandb.bulk_docs(self.file_doc_batch)
+                del self.file_doc_batch[:]
+    
+    def check_excluded(self, file_path):
+        for exclude in self.config['rsync_excluded']: # TO-DO: May have to switch to using a regular expression here
+            if exclude in file_path:
+                self.ver("Skipping excluded file {0}".format(os.path.join(root,name)))
+                logging.debug("Skipping {0}".format(os.path.join(root,name)))
+                return True
+            else:
+                return False
             
-        # Run through directory structure and check for any missing files
-        # SKIP IF ON FIRST SCAN FOR THIS DB
-        if (scan['firstscan'] == False):
-            for directory in dirs:
-                ver(directory) # temp to make sure trailing / is in 
-                # Get full list of most recent doc IDs in the directory from DB
-                view = scandb_views['check_for_delete']
-                result = scandb.get_view_result(
-                    view[0],
-                    view[1],
-                    reduce=False
-                )
-                # All files marked as "ok" in database for this directory
-                this_dir_result = result[[config['host_id'],directory,None]:[config['host_id'],directory,{}]]
-                
-                # All entries in the directory currently
-                actual_files = os.listdir(directory)
+    def get_filesystem_metadata(self, root, name):
+        
+        filedict = dict()
+        
+        # Get the scan path for the host opposite this one in order to construct the opposite host's file ID prefix
+        if self.config['is_source'] == True:
+            other_host_scan_dir = self.config['rsync_target_dir']
+        else:
+            other_host_scan_dir = self.config['rsync_source_dir']
 
-                # check filesystem for any missing files locally. Store ID of any that aren't there
-                for d in this_dir_result:
-                    if d['key'][2] not in actual_files:
-                        missing_files.append(d['id'])
-                
-            # For each missing file, check to see if it exists somewhere else on the host now.
-            for missing_file in missing_files:
-                view = scandb_views['duplicate_files']
-                result = scandb.get_view_result(
-                    view[0],
-                    view[1],
-                    reduce=False
-                )
-                with Document(scandb, document_id=missing_file) as doc:
-                    bound = [doc.name,doc.datemodified,doc.checksum,doc.size,doc.host]
-                    new_location = result[bound:bound]
-                    if new_location[0]['id'] != None:
-                        # File has moved.  Set previous doc's status and continue
-                        doc.status = {'state': 'moved', 'detail': new_location[0]['id']}
-                    else:
-                        # File is nowhere else in DB. Set as deleted and note time
-                        doc.status = {'state': 'deleted', 'detail': int(time.time())}
-                            
+        # Values stored regardless of OS detail check
+        filedict['IDprefix'] = self.get_file_id(self.config['host_id'], os.path.join(root,name), self.scandoc['directory'], 0)
+        filedict['syncIDprefix'] = self.get_file_id(self.config['other_host_id'], os.path.join(root,name), other_host_scan_dir, 0)
+        filedict['name'] = name
+        filedict['scanID'] = self.scandoc['_id'] # Un-needed... this will not update unless the file changes
+        filedict['host'] = self.config['host_id']
+        filedict['relationship'] = self.config['relationship']
+        filedict['path'] = root
+        filedict['datescanned'] = int(time.time()) # Should probably be removed... this will not update unless the file changes
+        filedict['type'] = "file"
+        filedict['source'] = self.config['is_source']
+        filedict['syncpath'] = self.trim_sync_path(os.path.join(root,name))
         
-    # Process any remaining files in the batch
-    if len(file_doc_batch) > 0:
-        ver("Scanning... Total files so far: {0}".format(scan['filecount']))
-        batch_analysis(scandb, file_doc_batch)
-        del file_doc_batch[:]
+        # Values from detail check
+        try:
+            stat = os.stat(os.path.join(root,name))
+            filedict['size'] = int(stat.st_size)
+            filedict['permissionsUNIX'] = stat.st_mode
+            filedict['datemodified'] = int(stat.st_mtime)
+            filedict['owner'] = stat.st_uid
+            filedict['group'] = stat.st_gid
+            filedict['goodscan'] = True
+            # Construct it's custom ID
+            filedict['_id'] = self.get_file_id(config['host_id'], os.path.join(root,name), self.scandoc['directory'], int(stat.st_mtime))
+            if (config['ultra_scan'] == True):
+                filedict['checksum'] = self.compute_file_checksum(root,name)
+            # Handle cases where the filename / path can't be properly encoded due to Unicode issues
+            if '-ERROR' in filedict['_id']:
+                filedict['status'] = {'state': 'error', 'detail': 'Path encode error'}
+            else:
+                filedict['status'] = {'state': 'ok', 'detail': None}
             
-    return True
+            # Increment size of directory in scan document
+            self.scandoc['directorysize'] = self.scandoc['directorysize'] + filedict['size']
+        
+        except OSError as e:
+            # Store as bad scan of file and iterate errors. Also set ID without a timestamp
+            filedict['_id'] = self.get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
+            self.scandoc['errorcount'] = self.scandoc['errorcount'] + 1
+            filedict['status'] = {'state': 'error', 'detail': "OS error: {0} {1}".format(e.errno, e.strerror)}
+            logging.error("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+        
+        return filedict
+        
+    def sweep(self):
+        
+        for root, dirs, files in os.walk(self.scandoc['directory'], topdown=False):
+            for name in files:
+                
+                # Skip excluded files / directories
+                if self.check_excluded(os.path.join(root,name)) == True:
+                    continue
+                
+                # Obtain detailed information on the file from the filesystem and add it to the batch
+                thisfile = self.get_filesystem_metadata(root, name)
+                self.file_doc_batch.append(thisfile)
+                self.scandoc['filecount'] = self.scandoc['filecount'] + 1
+                
+                # Process once we have the threshold number of docs
+                if len(self.file_doc_batch) >= self.config['doc_threshold']:
+                    self.ver("Scanning... Total files so far: {0}".format(scan['filecount']))
+                    self.batch_process()
+                    
+            # Iterate through directory tree, checking for any missing files
+            if (self.scandoc['firstscan'] == False):
+                
+                for directory in dirs:
+                    
+                    # Get full list of most recent doc IDs in the directory from DB
+                    view = self.scandb_views['check_for_delete']
+                    result = self.scandb.get_view_result(
+                        view[0],
+                        view[1],
+                        reduce=False
+                    )
+                    
+                    # Get all files marked as "ok" in database for this directory
+                    this_dir_result = result[[self.config['host_id'],directory,None]:[self.config['host_id'],directory,{}]]
+                    
+                    # Get all files currently in the filesystem directory
+                    actual_files = os.listdir(directory)
+                    
+                    # check filesystem for any missing files locally.
+                    # Store the IDs of any that aren't there so we can process them after the sweep is finished
+                    for d in this_dir_result:
+                        if d['key'][2] not in actual_files:
+                            self.missing_files.append(d['id'])
+                            self.ver("Missing file logged for check: {0}".format(d['id']))
+                            
+            
+        # Process any remaining files in the batch
+        if len(self.file_doc_batch) > 0:
+            self.ver("Scanning... Total files so far: {0}".format(scan['filecount']))
+            self.batch_process()
+            
+    def get_file_id(self, host_id, full_path, top_dir, timestamp):
+        # trim the top_dir from the full path
+        pathtrim = len(top_dir)
+        relative_path = full_path[pathtrim:]
+        if timestamp == 0:
+            appender = ''
+        else:
+            appender = str(timestamp)
+        try:
+            f1 = relative_path.decode('utf-8', errors='replace')
+            filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest() + appender
+            logging.debug("Hashing input: {0},{1}{2}, {3} Output:{4}".format(host_id,top_dir,full_path,timestamp,filehash))
+        except UnicodeDecodeError:
+            logging.error("Can't decode: " + relative_path)
+            filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
+        except UnicodeEncodeError:
+            logging.error("Can't encode: " + relative_path)
+            filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
+        return(filehash)
+
+    def trim_sync_path(self, fullpath):
+        if self.config['is_source'] == True:
+            return(re.sub('^{0}'.format(self.config['rsync_source_dir']),'',fullpath))
+        else:
+            return(re.sub('^{0}'.format(self.config['rsync_target_dir']),'',fullpath))
+        
+    def compute_file_checksum(self, root, fname):
+        path = os.path.join(root,fname)
+        filehash = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                filehash.update(chunk)
+        return filehash.hexdigest()
+
+    def ver(self, string):
+        if self.config['be_verbose'] == True:
+            print string
 
 # Print if verbose
 def ver(string):
     if config['be_verbose'] == True:
         print string
 
-# Return the unique ID for a file based upon hash and last scan timestamp
-# Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the passed timestamp
-# Removes the passed top_dir in order to make the ID consistent between the hosts when the root path is not the same
-# Returns only the hash if a zero is passed as the timestamp
-def get_file_id(host_id, full_path, top_dir, timestamp):
-    # trim the top_dir from the full path
-    pathtrim = len(top_dir)
-    relative_path = full_path[pathtrim:]
-    if timestamp == 0:
-        appender = ''
-    else:
-        appender = str(timestamp)
-    try:
-        logging.debug("Hashing input: {0},{1}{2}, {3} Output:{4}".format(host_id,top_dir,full_path,timestamp,filehash))
-        f1 = relative_path.decode('utf-8', errors='replace')
-        filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest() + appender
-    except UnicodeDecodeError:
-        logging.error("Can't decode: " + relative_path)
-        filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
-    except UnicodeEncodeError:
-        logging.error("Can't encode: " + relative_path)
-        filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
-    return(filehash)
-
-# Ultra-effective scanner process that computes an md5 hash of every file it encounters, but scans more slowly
-def compute_file_checksum(root,fname):
-    path = os.path.join(root,fname)
-    filehash = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            filehash.update(chunk)
-    return filehash.hexdigest()
-    
 # Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
     doc = Document(db)
@@ -1069,7 +1081,7 @@ def purge_old_dbs(client):
             ver("Deleting {0} due to no successful scans for {1} days.".format(db,7))
             doomed_db = client[db]
             doomed_db.delete()
-
+    
 # Check database views in database with <dbname> using client <c>, and the set of <views>
 def check_views(dbname, c, views):
     
@@ -1122,6 +1134,7 @@ def check_views(dbname, c, views):
         updater()
         versiondoc.update_field(action=versiondoc.list_field_append, field='history', value = versiondoc['current'])
         versiondoc.update_field(action=versiondoc.field_set, field='current', value = config['viewversion'])
+        versiondoc.save()
     else:
         ver("Database is up-to-date!")
 
@@ -1138,4 +1151,384 @@ def insert_search_indexes(dbname, client, searchddoc):
 
 if __name__ == "__main__":
     main()
+    
+    
+### Old code below from pre-OO scan model ###
+
+## Return the unique ID for a file based upon hash and last scan timestamp
+## Currently uses a 40-characer sha1 hash of the hostid, path and filename and appends the passed timestamp
+## Removes the passed top_dir in order to make the ID consistent between the hosts when the root path is not the same
+## Returns only the hash if a zero is passed as the timestamp
+#def get_file_id(host_id, full_path, top_dir, timestamp):
+#    # trim the top_dir from the full path
+#    pathtrim = len(top_dir)
+#    relative_path = full_path[pathtrim:]
+#    if timestamp == 0:
+#        appender = ''
+#    else:
+#        appender = str(timestamp)
+#    try:
+#        logging.debug("Hashing input: {0},{1}{2}, {3} Output:{4}".format(host_id,top_dir,full_path,timestamp,filehash))
+#        f1 = relative_path.decode('utf-8', errors='replace')
+#        filehash = hashlib.sha1(host_id + f1.encode('utf-8', errors='replace')).hexdigest() + appender
+#    except UnicodeDecodeError:
+#        logging.error("Can't decode: " + relative_path)
+#        filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
+#    except UnicodeEncodeError:
+#        logging.error("Can't encode: " + relative_path)
+#        filehash = hashlib.sha1(host_id).hexdigest() + appender + '-ERROR'
+#    return(filehash)
+#
+## Ultra-effective scanner process that computes an md5 hash of every file it encounters, but scans more slowly
+#def compute_file_checksum(root,fname):
+#    path = os.path.join(root,fname)
+#    filehash = hashlib.md5()
+#    with open(path, "rb") as f:
+#        for chunk in iter(lambda: f.read(4096), b""):
+#            filehash.update(chunk)
+#    return filehash.hexdigest()
+
+## filesystem scan function 
+#def directory_scan():
+#    # Database creation function
+#    def new_scan_db():
+#        # Create a new scan database for this relationship
+#        new_scan_db_name = 'scandb-' + str(int(time.time()))
+#        logging.info("Creating a new database for this scan: " + new_scan_db_name)
+#        try:
+#            new_scan_db = client.create_database(new_scan_db_name)
+#        except Exception:
+#            logging.fatal("Cannot create scan database")
+#            sys.exit("Something has gone wrong. See log for details")
+#            
+#        # Wait for new scandb to come online
+#        wait = True
+#        while (wait):
+#            if (new_scan_db.exists()):
+#                wait = False
+#            else:
+#                ver("Waiting for database to become available...")
+#                time.sleep(10)
+#        
+#        # Populate scandb views
+#        check_views(new_scan_db_name, client, scandb_views)
+#        insert_search_indexes(new_scan_db_name, client, search_indexes['files'])
+#        
+#        # insert viewversion document
+#        with Document(new_scan_db,document_id="scanversion") as versiondoc:
+#            versiondoc['current'] = config['viewversion']
+#            versiondoc['history']= []
+#            
+#        # Mark this scan as the first on this database
+#        scan['firstscan'] = True
+#        
+#        # Set database name for this_scan
+#        return new_scan_db_name
+#        
+#    # Scan database selection function
+#    def scan_db_selection(maindb, client):
+#        thisview = maindb_views['recent_scans']
+#        result = maindb.get_view_result(thisview[0], thisview[1], reduce=False,descending=True)   
+#        if result != None:
+#            logging.debug("Previous scans found")
+#            lastscan = result[[config['host_id'],{},{}]:[config['host_id'],None,0]]
+#            if lastscan != None:
+#                logging.debug("This host's scan database located: {0}".format(lastscan[0]['value']))
+#                return lastscan[0]['value']
+#            lastscan = result[[config['other_host_id'],{},{}]:[config['other_host_id'],None,0]]
+#            if lastscan != None:
+#                logging.debug("Other host's scan database located: {0}".format(lastscan[0]['value']))
+#                return lastscan[0]['value']
+#            else:
+#                logging.debug("Previous scan not found for either host in the relationship.")
+#                return new_scan_db()
+#        else:
+#            logging.debug("Previous scan not found for any host.")
+#            return new_scan_db()
+#    
+#    # SCAN BEGINS HERE    
+#    scan_result = False
+#    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_account']) as client:
+#        maindb = client[config['main_db_name']]
+#        scan = Document(maindb)
+#        scan.create()
+#        # initial scan status values
+#        scan['started'] = int(time.time())
+#        scan['ended'] = 0
+#        scan['source'] = config['is_source']
+#        scan['type'] = 'scan'
+#        scan['success'] = False
+#        scan['errorcount'] = 0
+#        scan['hostID'] = config['host_id']
+#        scan['directorysize'] = 0
+#        scan['relationship'] = config['relationship']
+#        #scan['firstscan'] = True <- not in use currently
+#        scan['previousscanID'] = ''
+#        scan['filecount'] = 0
+#        scan['firstscan'] = False # Assume not true unless a new DB gets created, in which case definitely true
+#        if (config['is_source']):
+#            scan['directory'] = config['rsync_source_dir']
+#        else:
+#            scan['directory'] = config['rsync_target_dir']
+#            
+#        # Save scan document so far and obtain an _id
+#        scan.save()
+#        
+#        # Find the DB last used by any scan in the relationship and open it, otherwise create a new one
+#        scan['database'] = scan_db_selection(maindb, client)
+#        try:
+#            scandb = client[scan['database']]
+#        except:
+#            logging.error("Scan db " + scan['database'] + " can't be found in Cloudant. Creating a replacement.")
+#            ver("Scan db " + scan['database'] + " can't be found in Cloudant. Creating a replacement.")
+#            scan['database'] = new_scan_db()
+#            scandb = client[scan['database']]
+#            
+#        logging.info("Scanning using database: " + scan['database'])
+#        
+#        ver("Beginning filesystem scan...")
+#        ver("Scan database: {0} Excluding: {1}".format(scan['database'], config['rsync_excluded']))
+#            
+#        walk_filesystem(scandb, scan)
+#        
+#        # Update scan document with final results
+#        if scan['errorcount'] == 0:
+#            scan['success'] = True
+#            scan_result = scan['filecount']
+#        else:
+#            scan_result = False
+#            
+#        logging.debug("Full scan stats: ")
+#        logging.debug(json.dumps(scan, sort_keys=True, indent=4, separators=(',', ': ')))
+#        
+#        # Save scan document    
+#        scan.save()
+#    
+#        return(scan_result)
+
+## Remove local filesystem path prefix to sync directory
+#def trim_sync_path(fullpath):
+#    if config['is_source'] == True:
+#        return(re.sub('^{0}'.format(config['rsync_source_dir']),'',fullpath))
+#    else:
+#        return(re.sub('^{0}'.format(config['rsync_target_dir']),'',fullpath))
+
+## Obtain local data on file. Returns dictionary
+#def get_file_metadata(root, name, scan):
+#    filedict = dict()
+#    
+#    # Get the scan path for the host opposite this one in order to construct the opposite host's file ID prefix
+#    if config['is_source'] == True:
+#        other_host_scan_dir = config['rsync_target_dir']
+#    else:
+#        other_host_scan_dir = config['rsync_source_dir']
+#        
+#    # Values stored regardless of OS detail check
+#    filedict['IDprefix'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
+#    filedict['syncIDprefix'] = get_file_id(config['other_host_id'], os.path.join(root,name), other_host_scan_dir, 0)
+#    filedict['name'] = name
+#    filedict['scanID'] = scan['_id']
+#    filedict['host'] = config['host_id']
+#    filedict['relationship'] = config['relationship']
+#    filedict['path'] = root
+#    filedict['datescanned'] = int(time.time())
+#    filedict['type'] = "file"
+#    filedict['source'] = config['is_source']
+#    filedict['syncpath'] = trim_sync_path(os.path.join(root,name))
+#    
+#    # Values from detail check
+#    try:
+#        stat = os.stat(os.path.join(root,name))
+#        filedict['size'] = int(stat.st_size)
+#        filedict['permissionsUNIX'] = stat.st_mode
+#        filedict['datemodified'] = int(stat.st_mtime)
+#        filedict['owner'] = stat.st_uid
+#        filedict['group'] = stat.st_gid
+#        filedict['goodscan'] = True
+#        # Construct it's custom ID
+#        filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], int(stat.st_mtime))
+#        if (config['ultra_scan'] == True):
+#            filedict['checksum'] = compute_file_checksum(root,name)
+#        # Handle cases where the filename / path can't be properly encoded due to Unicode issues
+#        if '-ERROR' in filedict['_id']:
+#            filedict['status'] = {'state': 'error', 'detail': 'Path encode error'}
+#        else:
+#            filedict['status'] = {'state': 'ok', 'detail': None}
+#        
+#        # Increment size of directory in scan document
+#        scan['directorysize'] = scan['directorysize'] + filedict['size']
+#    
+#    except OSError as e:
+#        # Store as bad scan of file and iterate errors. Also set ID without a timestamp
+#        filedict['_id'] = get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
+#        scan['errorcount'] = scan['errorcount'] + 1
+#        filedict['status'] = {'state': 'error', 'detail': "OS error: {0} {1}".format(e.errno, e.strerror)}
+#        logging.error("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+#        ver("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
+#        
+#    return filedict
+
+## Process to take a batch of scanned files and push them into the database (if needed)
+#def batch_analysis(scandb, files):
+#    
+#    # If this is the first in the database, don't bother checking anything.
+#    # Just insert all the file documents.  (We've just created the database and it's empty)
+#    if scan['firstscan'] == True:
+#        scandb.bulk_docs(files)
+#        return True
+#    
+#    # Batch insertion holder
+#    new_files = []
+#    
+#    # Make a dictionary of this batch's files (files_dict) to work on by their IDs
+#    files_dict = dict()
+#    for filedict in files:
+#        files_dict[filedict['_id']] = filedict
+#        
+#    # If the deep scan is enabled, validate checksums against existing files in DB. Otherwise use date/size
+#    if config['ultra_scan'] == True:
+#        view = scandb_views['checksums']
+#    else:
+#        view = scandb_views['scanned_files']
+#        
+#    myurl = 'https://{0}.cloudant.com/{1}/{2}/_view/{3}?reduce=false&include_docs=true'.format(
+#        config['cloudant_account'],
+#        scandb.metadata()['db_name'],
+#        view[0],
+#        view[1]
+#    )
+#
+#    # Check for any existing docs based on the full ID of each file.  Uses primary index
+#    # Currently using requests library since Cloudant Python cannot support enough keys per GET
+#    my_header = {'Content-Type': 'application/json'}
+#    r = requests.post(
+#        myurl,
+#        headers = my_header,
+#        auth = (config['cloudant_user'],config['cloudant_auth']),
+#        data = json.dumps({ 'keys': files_dict.keys() })
+#    )
+#    result = r.json()
+#
+#    # If we've found some matching file IDs, check them for any change in size or checksum
+#    # The file's ID should be changed if the content has updated because it's tied to the update date.
+#    # If it hasn't, there's something likely wrong with the file
+#    if len(result['rows']) > 0:
+#        if config['ultra_scan'] == True:
+#            check_field = 'checksum'
+#        else:
+#            check_field = 'size'
+#        for f in result['rows']:
+#            # If the contents of the file have changed locally:
+#            if f['value'] != files_dict[f['key']][check_field]:
+#                # Update the existing file document's content details, append a possible corruption warning.
+#                now = int(time.time())
+#                files_dict.pop(f['key']) # remove the file from the dictionary to work on
+#                logging.warning("{0} mismatch from previous scan for {1}".format(check_field,possible_corrupt_file['name']))
+#                # Update the document in the database for the file directly.
+#                # One DB operation per changed file.
+#                # Might be best done in bulk, but first iteration using "easier" method
+#                with Document(scandb, document_id=f['key']) as doc:
+#                    doc['error'] = "{0} mismatch without filesystem date change found on {1}. Possible file corruption!".format(check_field, pretty_time(now))
+#                    doc['status'] = {'state': 'ok', 'detail': 'possibly corrupted'}
+#                    doc[check_field] = f['value']
+#    else:
+#        # No existing file IDs have been found.
+#        # Search for previous versions based on prefix
+#        # UNFINISHED
+#        myurl = 'https://{0}.cloudant.com/{1}/{2}/_view/{3}?reduce=false&include_docs=true'.format(
+#            config['cloudant_account'],
+#            scandb.metadata()['db_name'],
+#            view[0],
+#            view[1]
+#        )
+#        
+#    # Insert batch
+#    if len(new_files) > 0:
+#        bulk_result = scandb.bulk_docs(new_files)
+#        #ver("Inserted a batch of {0} entries into {1}".format(len(new_files),scandb.metadata()['db_name']))
+#        logging.info("Inserted a batch of {0} entries into {1}".format(len(new_files),scandb.metadata()['db_name']))
+#        for row in bulk_result:
+#            if 'error' in row.keys():
+#                logging.error("Couldn't insert {0}: {1}".format(row['id'],row['reason']))
+#                ver("ERROR: Couldn't insert {0}: {1}".format(row['id'],row['reason']))
+#        
+#    # empty out placeholders
+#    del new_files[:]
+#    files_dict.clear()
+    
+## The "Heavy" operation which iterates through the specified path and updates the database appropriately
+#def walk_filesystem(scandb, scan):
+#    # List of document dictionaries for insertion into database
+#    file_doc_batch = []
+#    # List of files from DB not found on local filesystem
+#    missing_files = []
+#        
+#    # Sweep filesystem, storing metadata for each file along the way, executing db batch operation when appropriate
+#    for root, dirs, files in os.walk(scan['directory'], topdown=False):
+#        for name in files:
+#            skip = False
+#            for exclude in config['rsync_excluded']: # May have to switch to using a regular expression here**
+#                if exclude in os.path.join(root,name):
+#                    ver("Skipping excluded file {0}".format(os.path.join(root,name)))
+#                    logging.debug("Skipping {0}".format(os.path.join(root,name)))
+#                    skip = True
+#            if skip == True:
+#                continue
+#            thisfile = get_file_metadata(root, name, scan)
+#            file_doc_batch.append(thisfile)
+#            scan['filecount'] = scan['filecount'] + 1
+#            if len(file_doc_batch) >= config['doc_threshold']:
+#                ver("Scanning... Total files so far: {0}".format(scan['filecount']))
+#                batch_analysis(scandb, file_doc_batch)
+#                del file_doc_batch[:]
+#            
+#        # Run through directory structure and check for any missing files
+#        # SKIP IF ON FIRST SCAN FOR THIS DB
+#        if (scan['firstscan'] == False):
+#            for directory in dirs:
+#                ver(directory) # temp to make sure trailing / is in 
+#                # Get full list of most recent doc IDs in the directory from DB
+#                view = scandb_views['check_for_delete']
+#                result = scandb.get_view_result(
+#                    view[0],
+#                    view[1],
+#                    reduce=False
+#                )
+#                # All files marked as "ok" in database for this directory
+#                this_dir_result = result[[config['host_id'],directory,None]:[config['host_id'],directory,{}]]
+#                
+#                # All entries in the directory currently
+#                actual_files = os.listdir(directory)
+#
+#                # check filesystem for any missing files locally. Store ID of any that aren't there
+#                for d in this_dir_result:
+#                    if d['key'][2] not in actual_files:
+#                        missing_files.append(d['id'])
+#                
+#            # For each missing file, check to see if it exists somewhere else on the host now.
+#            for missing_file in missing_files:
+#                view = scandb_views['duplicate_files']
+#                result = scandb.get_view_result(
+#                    view[0],
+#                    view[1],
+#                    reduce=False
+#                )
+#                with Document(scandb, document_id=missing_file) as doc:
+#                    bound = [doc.name,doc.datemodified,doc.checksum,doc.size,doc.host]
+#                    new_location = result[bound:bound]
+#                    if new_location[0]['id'] != None:
+#                        # File has moved.  Set previous doc's status and continue
+#                        doc.status = {'state': 'moved', 'detail': new_location[0]['id']}
+#                    else:
+#                        # File is nowhere else in DB. Set as deleted and note time
+#                        doc.status = {'state': 'deleted', 'detail': int(time.time())}
+#                            
+#        
+#    # Process any remaining files in the batch
+#    if len(file_doc_batch) > 0:
+#        ver("Scanning... Total files so far: {0}".format(scan['filecount']))
+#        batch_analysis(scandb, file_doc_batch)
+#        del file_doc_batch[:]
+#            
+#    return True
 
