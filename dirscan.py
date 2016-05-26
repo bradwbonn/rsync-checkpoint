@@ -28,6 +28,7 @@ from cloudant.view import View
 from cloudant import cloudant
 
 import requests # Still needed for a few specific Cloudant queries. Hopefully not for long
+from pprint import pprint
 
 logging_levels = dict(
         CRITICAL = 50,
@@ -782,8 +783,11 @@ class FileScan(object):
             
             # Remove file's entry from the batch
             # We have to remove the revision field for it to match the batch dictionary
+            # CURRENTLY BROKEN
             doc_minus_rev = f['doc']
             doc_minus_rev.pop('_rev', None)
+            pprint(doc_minus_rev)
+            pprint(self.file_doc_batch[0])
             self.file_doc_batch.remove(doc_minus_rev)
     
     # For each missing file, check to see if it exists somewhere else on the host now.
