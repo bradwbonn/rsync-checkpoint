@@ -4,9 +4,8 @@
 # * Files that are moved, then altered between scans will be marked as deleted in their old location
 
 # to-do:
-# * check_existing() is not working due to failure to remove checked items from the list. 
-# * switch check_existing() to use Cloudant lib
-# * Verify check_excluded() is working properly because it's probably not
+# URGENT: missing files not being detected?
+# * Verify check_excluded() is working for filenames not just directories
 
 # Possible status values based on current code:
 # status: {'state': 'error', 'detail': 'error reason'}
@@ -28,7 +27,6 @@ from cloudant.view import View
 from cloudant import cloudant
 
 import requests # Still needed for a few specific Cloudant queries. Hopefully not for long
-from pprint import pprint
 
 logging_levels = dict(
         CRITICAL = 50,
@@ -589,7 +587,7 @@ class FileScan(object):
             ):
         
         # base variables
-        self.file_doc_batch = []
+        self.file_doc_batch = dict()
         self.missing_files = []
         self.complete = False
         self.client = client
@@ -732,29 +730,39 @@ class FileScan(object):
     # Corrupted entries in DB updated whenever found
     def check_existing(self):
         
-        ids_to_find = dict()
-        for filedict in self.file_doc_batch:
-            ids_to_find[filedict['_id']] = filedict
-        
-        # Check for any existing docs based on the full ID of each file.  Uses primary index
-        # Currently using requests library - should be able to use Cloudant library now
-        myurl = 'https://{0}.cloudant.com/{1}/_all_docs?include_docs=true'.format(
-            self.config['cloudant_account'],
-            self.scandb.metadata()['db_name']
-        )
-        my_header = {'Content-Type': 'application/json'}
-        try:
-            r = requests.post(
-                myurl,
-                headers = my_header,
-                auth = (config['cloudant_user'],config['cloudant_auth']),
-                data = json.dumps({ 'keys': ids_to_find.keys() })
+        def old_method():
+            # Uses requests library
+            myurl = 'https://{0}.cloudant.com/{1}/_all_docs?include_docs=true'.format(
+                self.config['cloudant_account'],
+                self.scandb.metadata()['db_name']
             )
-            result = r.json()
-        except Exception as e:
-            logging.fatal("Unable to execute HTTP POST: {0}".format(e))
-            sys.exit("Unable to execute HTTP POST: {0}".format(e))
+            my_header = {'Content-Type': 'application/json'}
+            try:
+                r = requests.post(
+                    myurl,
+                    headers = my_header,
+                    auth = (config['cloudant_user'],config['cloudant_auth']),
+                    data = json.dumps({ 'keys': self.file_doc_batch.keys() })
+                )
+                result = r.json()
+            except Exception as e:
+                logging.fatal("Unable to execute HTTP POST: {0}".format(e))
+                sys.exit("Unable to execute HTTP POST: {0}".format(e))
+            return result
         
+        def new_method():
+            # Uses Cloudant python library BROKEN: Issue #177 in python-cloudant
+            self.ver(self.file_doc_batch.keys())
+            result = self.scandb.all_docs(
+                include_docs = True,
+                keys = self.file_doc_batch.keys()
+            )
+            return result
+        
+        post_start = time.time()
+        result = old_method()
+        self.ver("DB op time: {0} sec".format(time.time() - post_start))
+            
         # If the deep scan is enabled, validate checksums against existing files in DB. Otherwise use date/size
         if self.config['ultra_scan'] == True:
             check_field = 'checksum'
@@ -765,35 +773,35 @@ class FileScan(object):
         # The file's ID should be changed if the content has updated because it's tied to the update date.
         # If it hasn't, there's something likely wrong with the file
         for f in result['rows']:
-            
-            # If the contents of the file have changed locally:
-            if f['doc'][check_field] != ids_to_find[f['key']][check_field]:
-                
-                # Update the existing file document's content details, append a possible corruption warning.
-                now = int(time.time())
-                logging.warning("{0} mismatch from previous scan for {1}".format(check_field,possible_corrupt_file['name']))
-                
-                # Update the document in the database for the file directly.
-                # One DB operation per changed file.
-                # Might be best done in bulk, but first iteration using "easier" method
-                with Document(self.scandb, document_id=f['key']) as doc:
-                    doc['error'] = "{0} mismatch without filesystem date change found on {1}. Possible file corruption!".format(check_field, pretty_time(now))
-                    doc['status'] = {'state': 'ok', 'detail': 'possibly corrupted'}
-                    doc[check_field] = f['value']
-            
-            # Remove file's entry from the batch
-            # We have to remove the revision field for it to match the batch dictionary
-            # CURRENTLY BROKEN
-            doc_minus_rev = f['doc']
-            doc_minus_rev.pop('_rev', None)
-            pprint(doc_minus_rev)
-            pprint(self.file_doc_batch[0])
-            self.file_doc_batch.remove(doc_minus_rev)
+            if 'doc' in f:
+                # If the contents of the file have changed locally:
+                if f['doc'][check_field] != self.file_doc_batch[f['key']][check_field]:
+                    self.ver(f['doc'])
+                    self.ver("{0}/{1} has changed locally without change to modified date. Possibly corrupted!".format(f['doc']['path'], f['doc']['name']))
+                    # Update the existing file document's content details, append a possible corruption warning.
+                    now = int(time.time())
+                    logging.warning("{0} mismatch from previous scan for {1}".format(check_field,f['doc']['name']))
+                    
+                    # Update the document in the database for the file directly.
+                    # One DB operation per changed file.
+                    # Might be best done in bulk, but first iteration using "easier" method
+                    with Document(self.scandb, document_id=f['key']) as doc:
+                        doc['error'] = "{0} mismatch without filesystem date change. Possible file corruption!".format(check_field)
+                        doc['status'] = {'state': 'ok', 'detail': 'possibly corrupted'}
+                        doc[check_field] = self.file_doc_batch[f['key']][check_field]
+                        doc['size'] = self.file_doc_batch[f['key']]['size']
+                        doc['datescanned'] = int(time.time())
+                        
+                # Remove file's entry from the batch
+                self.file_doc_batch.pop(f['key'], None)
+            else:
+                self.ver("FileID {0} not found in DB and will be inserted.".format(f['key']))
     
     # For each missing file, check to see if it exists somewhere else on the host now.
     # Currently done as one DB operation per file, but this is only for files that have
     # been moved or deleted, so their frequency will be much less
     def check_missing(self):
+        self.ver("{0} missing files to check...".format(len(self.missing_files)))
         for missing_file in self.missing_files:
             view = self.scandb_views['duplicate_files']
             result = self.scandb.get_view_result(
@@ -802,28 +810,41 @@ class FileScan(object):
                 reduce=False
             )
             with Document(self.scandb, document_id=missing_file) as doc:
-                bound = [doc.name,doc.datemodified,doc.checksum,doc.size,doc.host]
+                bound = [
+                    doc.name,
+                    doc.datemodified,
+                    doc.checksum,
+                    doc.size,
+                    doc.host
+                    ]
                 new_location = result[bound:bound]
                 if new_location[0]['id'] != None:
                     # File has moved.  Set previous doc's status and continue
                     doc.status = {'state': 'moved', 'detail': new_location[0]['id']}
+                    self.ver("{0} moved. New ID: {1}".format(doc.name,new_location[0]['id']))
                 else:
                     # File is nowhere else in DB. Set as deleted and note time
                     doc.status = {'state': 'deleted', 'detail': int(time.time())}
+                    self.ver("{0} not found, marking as deleted.".format(doc.name))
         del self.missing_files[:]
     
     def batch_process(self):
         # If this is the first in the database, don't bother checking anything.
         # Just insert all the file documents.  (We've just created the database and it's empty)
         if self.scandoc['firstscan'] == True:
-            self.scandb.bulk_docs(self.file_doc_batch)
-            del self.file_doc_batch[:]
+            self.scandb.bulk_docs(self.file_doc_batch.values())
+            self.file_doc_batch.clear()
         # Otherwise, check the files against the database
         else:
+            # Check existing files for changes against DB, then remove them from the batch
             self.check_existing()
+            # Insert remaining "new" documents and clear the batch
             if len(self.file_doc_batch) > 0:
-                self.scandb.bulk_docs(self.file_doc_batch)
-                del self.file_doc_batch[:]
+                self.scandb.bulk_docs(self.file_doc_batch.values())
+                self.file_doc_batch.clear()
+        # Update scan document in DB
+        self.scandoc.save()
+        self.ver("Batch processed. Continuing scan.")
     
     def check_excluded(self, file_path):
         for exclude in self.config['rsync_excluded']: # TO-DO: May have to switch to using a regular expression here
@@ -848,11 +869,11 @@ class FileScan(object):
         filedict['IDprefix'] = self.get_file_id(self.config['host_id'], os.path.join(root,name), self.scandoc['directory'], 0)
         filedict['syncIDprefix'] = self.get_file_id(self.config['other_host_id'], os.path.join(root,name), other_host_scan_dir, 0)
         filedict['name'] = name
-        filedict['scanID'] = self.scandoc['_id'] # Un-needed... this will not update unless the file changes
+        filedict['scanID'] = self.scandoc['_id'] # this will not update unless the file changes
         filedict['host'] = self.config['host_id']
         filedict['relationship'] = self.config['relationship']
         filedict['path'] = root
-        filedict['datescanned'] = int(time.time()) # Should probably be removed... this will not update unless the file changes
+        filedict['datescanned'] = int(time.time()) # this will not update unless the file changes
         filedict['type'] = "file"
         filedict['source'] = self.config['is_source']
         filedict['syncpath'] = self.trim_sync_path(os.path.join(root,name))
@@ -867,9 +888,11 @@ class FileScan(object):
             filedict['group'] = stat.st_gid
             filedict['goodscan'] = True
             # Construct it's custom ID
-            filedict['_id'] = self.get_file_id(config['host_id'], os.path.join(root,name), self.scandoc['directory'], int(stat.st_mtime))
-            if (config['ultra_scan'] == True):
+            filedict['_id'] = self.get_file_id(self.config['host_id'], os.path.join(root,name), self.scandoc['directory'], int(stat.st_mtime))
+            if (self.config['ultra_scan'] == True):
                 filedict['checksum'] = self.compute_file_checksum(root,name)
+            else:
+                filedict['checksum'] = 0
             # Handle cases where the filename / path can't be properly encoded due to Unicode issues
             if '-ERROR' in filedict['_id']:
                 filedict['status'] = {'state': 'error', 'detail': 'Path encode error'}
@@ -881,7 +904,7 @@ class FileScan(object):
         
         except OSError as e:
             # Store as bad scan of file and iterate errors. Also set ID without a timestamp
-            filedict['_id'] = self.get_file_id(config['host_id'], os.path.join(root,name), scan['directory'], 0)
+            filedict['_id'] = self.get_file_id(config['host_id'], os.path.join(root,name), self.scandoc['directory'], 0)
             self.scandoc['errorcount'] = self.scandoc['errorcount'] + 1
             filedict['status'] = {'state': 'error', 'detail': "OS error: {0} {1}".format(e.errno, e.strerror)}
             logging.error("File {0} can't be scanned: {1} {2}".format(os.path.join(root,name), e.errno, e.strerror))
@@ -899,7 +922,7 @@ class FileScan(object):
                 
                 # Obtain detailed information on the file from the filesystem and add it to the batch
                 thisfile = self.get_filesystem_metadata(root, name)
-                self.file_doc_batch.append(thisfile)
+                self.file_doc_batch[thisfile['_id']] = thisfile
                 self.scandoc['filecount'] = self.scandoc['filecount'] + 1
                 
                 # Process once we have the threshold number of docs
@@ -911,7 +934,7 @@ class FileScan(object):
             if (self.scandoc['firstscan'] == False):
                 
                 for directory in dirs:
-                    
+                    #ver("Searching {0} for missing files".format(directory))
                     # Get full list of most recent doc IDs in the directory from DB
                     view = self.scandb_views['check_for_delete']
                     result = self.scandb.get_view_result(
@@ -921,22 +944,27 @@ class FileScan(object):
                     )
                     
                     # Get all files marked as "ok" in database for this directory
-                    this_dir_result = result[[self.config['host_id'],directory,None]:[self.config['host_id'],directory,{}]]
                     this_dir_path = os.path.join(root,directory)
-                    
+                    this_dir_result = result[[self.config['host_id'],this_dir_path,None]:[self.config['host_id'],this_dir_path,{}]]
+                    #ver("Files expected:")
+                    #ver(this_dir_result)
+                    #ver("Files actual:")
+                
                     # Get all files currently in the filesystem directory
                     try:
                         actual_files = os.listdir(this_dir_path)
+                        #ver(actual_files)
                     except OSError as e:
                         self.ver("Couldn't open {0}: {1}".format(this_dir_path, e))
                     
                     # check filesystem for any missing files locally.
                     # Store the IDs of any that aren't there so we can process them after the sweep is finished
                     for d in this_dir_result:
+                        #self.ver("File: {0} in {1}?".format(d['key'][2], actual_files))
                         if d['key'][2] not in actual_files:
                             self.missing_files.append(d['id'])
                             self.ver("Missing file logged for check: {0}".format(d['id']))
-                            
+                    #sys.exit("<END>")
             
         # Process any remaining files in the batch
         if len(self.file_doc_batch) > 0:
@@ -980,6 +1008,7 @@ class FileScan(object):
     def ver(self, string):
         if self.config['be_verbose'] == True:
             print string
+        logging.info(string)
 
     # Check database views in database with <dbname> using client <c>, and the set of <views>
     def check_views(self, dbname, views):
@@ -1041,6 +1070,7 @@ class FileScan(object):
 def ver(string):
     if config['be_verbose'] == True:
         print string
+    logging.info(string)
 
 # Create a relationship entity and write an associated document into the database
 def create_new_relationship(db):
@@ -1098,10 +1128,6 @@ def create_new_relationship(db):
     # Return the doc _id of the new relationship
     return config['relationship']    
     
-# TO-DO: Find a host by name, using search index
-def find_host(host_name):
-    pass
-
 # Find a relationship by listing all known relationships and letting the user choose the appropriate one
 def list_relationships(db):
     print "| Which relationship is this host part of?"
@@ -1216,7 +1242,6 @@ def check_views(dbname, c, views):
         versiondoc.save()
     else:
         ver("Database is up-to-date!")
-
 
 def insert_search_indexes(dbname, client, searchddoc):
     db = client[dbname]
