@@ -5,6 +5,7 @@
 
 # to-do:
 # URGENT: missing files not being detected?
+# URGENT: Syncstate view outputting filepath+name, name, host  ->duplicate data causing lack of file detection?
 # * Verify check_excluded() is working for filenames not just directories
 
 # Possible status values based on current code:
@@ -85,7 +86,7 @@ config = dict(
     # Time threshold to retain older scan databases for in seconds (default is 90 days)
     db_max_age = 7776000,
     # Version number of the views in use by this script
-    viewversion = 0.042,
+    viewversion = 0.043,
     # Maximum number of keys to post to a view (for URI length limitation controls)
     # This can be increased once Cloudant-Python Issue #90 is resolved
     post_threshold = 2000
@@ -115,13 +116,13 @@ scandb_views = dict(
     file_types = [
         '_design/filetypes',
         'types',
-        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.scanID, filetype], doc.size); } }',
+        'function (doc) {if (doc.type === "file" && doc.goodscan === true) { filetype = doc.name.substr((~-doc.name.lastIndexOf(".") >>> 0) + 2); emit([doc.host, doc.relationship, filetype], doc.size); } }',
         '_stats'
     ],
     problem_files = [ 
         '_design/problemfiles',
         'problemfiles',
-        'function (doc) {if (doc.type === "file" && doc.goodscan !== true) {emit([doc.scanID,doc.path,doc.name], 1);}}',
+        'function (doc) {if (doc.type === "file" && doc.status.state !== "ok") {emit([doc.scanID,doc.path,doc.name], doc.status.detail);}}',
         '_count'
     ],
     source_files = [
