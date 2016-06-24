@@ -5,7 +5,6 @@
 
 # to-do:
 # URGENT: missing files not being detected?
-# URGENT: Syncstate view outputting filepath+name, name, host  ->duplicate data causing lack of file detection?
 # * Verify check_excluded() is working for filenames not just directories
 
 # Possible status values based on current code:
