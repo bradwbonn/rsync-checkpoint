@@ -811,20 +811,20 @@ class FileScan(object):
             )
             with Document(self.scandb, document_id=missing_file) as doc:
                 bound = [
-                    doc.name,
-                    doc.datemodified,
-                    doc.checksum,
-                    doc.size,
-                    doc.host
+                    doc['name'],
+                    doc['datemodified'],
+                    doc['checksum'],
+                    doc['size'],
+                    doc['host']
                     ]
                 new_location = result[bound:bound]
                 if new_location[0]['id'] != None:
                     # File has moved.  Set previous doc's status and continue
-                    doc.status = {'state': 'moved', 'detail': new_location[0]['id']}
+                    doc['status'] = {'state': 'moved', 'detail': new_location[0]['id']}
                     self.ver("{0} moved. New ID: {1}".format(doc.name,new_location[0]['id']))
                 else:
                     # File is nowhere else in DB. Set as deleted and note time
-                    doc.status = {'state': 'deleted', 'detail': int(time.time())}
+                    doc['status'] = {'state': 'deleted', 'detail': int(time.time())}
                     self.ver("{0} not found, marking as deleted.".format(doc.name))
         del self.missing_files[:]
     
