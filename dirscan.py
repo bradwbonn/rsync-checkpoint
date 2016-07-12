@@ -821,11 +821,11 @@ class FileScan(object):
                 if new_location[0]['id'] != None:
                     # File has moved.  Set previous doc's status and continue
                     doc['status'] = {'state': 'moved', 'detail': new_location[0]['id']}
-                    self.ver("{0} moved. New ID: {1}".format(doc.name,new_location[0]['id']))
+                    self.ver("{0} moved. New ID: {1}".format(doc['name'],new_location[0]['id']))
                 else:
                     # File is nowhere else in DB. Set as deleted and note time
                     doc['status'] = {'state': 'deleted', 'detail': int(time.time())}
-                    self.ver("{0} not found, marking as deleted.".format(doc.name))
+                    self.ver("{0} not found, marking as deleted.".format(doc['name']))
         del self.missing_files[:]
     
     def batch_process(self):
