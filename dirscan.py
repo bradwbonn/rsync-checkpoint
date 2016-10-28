@@ -214,7 +214,7 @@ def main():
     if (os.path.exists(myargs.config)):
         
         # Load configuration settings from file
-        ver("Loading " + myargs.config)
+        ver(" Loading " + myargs.config)
         load_config(myargs.config)
         logging.debug(json.dumps(config, sort_keys=True, indent=4, separators=(',', ': ')))
         logging.info("Reading in configuration file: {0}".format(myargs.config))
@@ -228,12 +228,12 @@ def main():
                 
         else:
             # Initiate scan
-            ver("Initiating scan...")
+            ver(" Initiating scan...")
             with cloudant(config['cloudant_user'],config['cloudant_auth'],account=config['cloudant_account']) as client:
                 # Create scan object and execute
                 this_scan = FileScan(client, maindb_views, scandb_views, config)
                 elapsed_time = this_scan.run()
-                ver("Scan completed at {0} on {1} files.".format(this_scan.scandoc['ended'],this_scan.scandoc['filecount']))
+                ver(" Scan completed at {0} on {1} files.".format(this_scan.scandoc['ended'],this_scan.scandoc['filecount']))
 
         # We're done here
         sys.exit()
@@ -296,27 +296,27 @@ def create_initial_config(config_file):
     try:
         # Open existing database
         maindb = client[config['main_db_name']]
-        ver(" Main scan database found")
+        ver("  Main scan database found")
         logging.debug("{0} found".format(config['main_db_name']))
         
     except Exception:
         logging.info("Creating {0}".format(config['main_db_name']))
         # Create database if it doesn't exist
         maindb = client.create_database(config['main_db_name'])
-        ver(" Database created")
+        ver("  Database created")
     
-    # Give a delay to allow the database to respond        
-    wait = True
-    while (wait):
-        if (maindb.exists()):
-            wait = False
-        else:
-            ver(" Waiting for database to become available...")
-            time.sleep(10)
-            
-    # Insert design documents for required indexes in main db
-    # Check each ddoc for existence before inserting
-    check_views(maindb, client, maindb_views)
+        # Give a delay to allow the database to respond        
+        wait = True
+        while (wait):
+            if (maindb.exists()):
+                wait = False
+            else:
+                ver("  Waiting for database to become available...")
+                time.sleep(10)
+                
+        # Insert design documents for required indexes in main db
+        # Check each ddoc for existence before inserting
+        check_views(config['main_db_name'], maindb_views)
     
     # Begin process of collecting data
     relationship_status = ''
@@ -609,7 +609,7 @@ class FileScan(object):
             self.scandb = client[self.scan_db_name]
             self.scandoc['firstscan'] = False
         except KeyError as e:
-            self.ver("Unable to open database {0}".format(self.scan_db_name))
+            self.ver("  Unable to open database {0}".format(self.scan_db_name))
             logging.warn("Unable to open database {0}".format(self.scan_db_name))
             self.scan_db_name = self.new_scan_db()
             self.scandb = client[self.scan_db_name]
@@ -672,24 +672,24 @@ class FileScan(object):
         result = self.maindb.get_view_result(thisview[0], thisview[1], reduce=False,descending=True)   
         if result != None:
             logging.debug("Previous scans found")
-            self.ver("Previous scans located")
+            self.ver("  Previous scans located")
             lastscan = result[[config['host_id'],{},{}]:[config['host_id'],None,0]]
             if (lastscan != None) and (len(lastscan) > 0):
                 logging.debug("This host's scan database located: {0}".format(lastscan[0]['value']))
-                self.ver("This host's scan database located: {0}".format(lastscan[0]['value']))
+                #self.ver("  This host's scan database located: {0}".format(lastscan[0]['value']))
                 return lastscan[0]['value']
             lastscan = result[[config['other_host_id'],{},{}]:[config['other_host_id'],None,0]]
             if (lastscan != None) and (len(lastscan) > 0):
                 logging.debug("Other host's scan database located: {0}".format(lastscan[0]['value']))
-                self.ver("Other host's scan database located: {0}".format(lastscan[0]['value']))
+                #self.ver("  Other host's scan database located: {0}".format(lastscan[0]['value']))
                 return lastscan[0]['value']
             else:
                 logging.debug("Previous scan not found for either host in the relationship.")
-                self.ver("Previous scan not found for either host in the relationship.")
+                self.ver("  Previous scan not found for either host in the relationship.")
                 return self.new_scan_db()
         else:
             logging.debug("Previous scan not found for any host.")
-            self.ver("Previous scan not found for any host.")
+            self.ver("  Previous scan not found for any host.")
             return self.new_scan_db()
         
     def run(self):
@@ -698,7 +698,7 @@ class FileScan(object):
         
         logging.info("Scanning using database: " + self.scandoc['database'])
         logging.info("Scan started at " + datetime.utcnow().isoformat(' ') + " UTC")
-        self.ver("Scan database: {0} Excluding: {1}".format(self.scandoc['database'], self.config['rsync_excluded']))
+        self.ver("  Scan database: {0} Excluding: {1}".format(self.scandoc['database'], self.config['rsync_excluded']))
         
         # Iterate through filesystem
         self.sweep()
@@ -710,6 +710,8 @@ class FileScan(object):
         if self.scandoc['errorcount'] == 0:
             self.scandoc['success'] = True
         self.scandoc['ended'] = int(time.time())
+        if self.scandoc['ended'] == self.scandoc['started']:
+                self.scandoc['ended'] = self.scandoc['ended'] + 1
         
         # Save scan document    
         self.scandoc.save()
@@ -730,7 +732,7 @@ class FileScan(object):
     # Corrupted entries in DB updated whenever found
     def check_existing(self):
         
-        def old_method():
+        def old_method(): # Python requests library version
             # Uses requests library
             myurl = 'https://{0}.cloudant.com/{1}/_all_docs?include_docs=true'.format(
                 self.config['cloudant_account'],
@@ -750,9 +752,8 @@ class FileScan(object):
                 sys.exit("Unable to execute HTTP POST: {0}".format(e))
             return result
         
-        def new_method():
-            # Uses Cloudant python library BROKEN: Issue #177 in python-cloudant
-            self.ver(self.file_doc_batch.keys())
+        def new_method(): # Cloudant python library version
+            #self.ver(self.file_doc_batch.keys())
             result = self.scandb.all_docs(
                 include_docs = True,
                 keys = self.file_doc_batch.keys()
@@ -760,8 +761,8 @@ class FileScan(object):
             return result
         
         post_start = time.time()
-        result = old_method()
-        self.ver("DB op time: {0} sec".format(time.time() - post_start))
+        result = new_method()
+        #self.ver("  DB op time: {0} sec".format(time.time() - post_start))
             
         # If the deep scan is enabled, validate checksums against existing files in DB. Otherwise use date/size
         if self.config['ultra_scan'] == True:
@@ -772,12 +773,15 @@ class FileScan(object):
         # If we've found some matching file IDs, check them for any change in size or checksum
         # The file's ID should be changed if the content has updated because it's tied to the update date.
         # If it hasn't, there's something likely wrong with the file
+                
         for f in result['rows']:
-            if 'doc' in f:
+            if ('doc' in f):
+                # If in the rare case a file's doc was deleted in the database, skip over it to re-insert
+                if f['doc'] == None:
+                        continue
                 # If the contents of the file have changed locally:
                 if f['doc'][check_field] != self.file_doc_batch[f['key']][check_field]:
-                    self.ver(f['doc'])
-                    self.ver("{0}/{1} has changed locally without change to modified date. Possibly corrupted!".format(f['doc']['path'], f['doc']['name']))
+                    self.ver("  {0}/{1} has changed locally without change to modified date. Possibly corrupted!".format(f['doc']['path'], f['doc']['name']))
                     # Update the existing file document's content details, append a possible corruption warning.
                     now = int(time.time())
                     logging.warning("{0} mismatch from previous scan for {1}".format(check_field,f['doc']['name']))
@@ -795,38 +799,48 @@ class FileScan(object):
                 # Remove file's entry from the batch
                 self.file_doc_batch.pop(f['key'], None)
             else:
-                self.ver("FileID {0} not found in DB and will be inserted.".format(f['key']))
+                self.ver("  FileID {0} not found in DB and will be inserted.".format(f['key']))
     
     # For each missing file, check to see if it exists somewhere else on the host now.
     # Currently done as one DB operation per file, but this is only for files that have
     # been moved or deleted, so their frequency will be much less
     def check_missing(self):
-        self.ver("{0} missing files to check...".format(len(self.missing_files)))
+        #self.ver("  {0} missing files to check...".format(len(self.missing_files)))
         for missing_file in self.missing_files:
-            view = self.scandb_views['duplicate_files']
-            result = self.scandb.get_view_result(
-                view[0],
-                view[1],
-                reduce=False
-            )
-            with Document(self.scandb, document_id=missing_file) as doc:
-                bound = [
-                    doc['name'],
-                    doc['datemodified'],
-                    doc['checksum'],
-                    doc['size'],
-                    doc['host']
-                    ]
-                new_location = result[bound:bound]
-                if new_location[0]['id'] != None:
-                    # File has moved.  Set previous doc's status and continue
-                    doc['status'] = {'state': 'moved', 'detail': new_location[0]['id']}
-                    self.ver("{0} moved. New ID: {1}".format(doc['name'],new_location[0]['id']))
-                else:
-                    # File is nowhere else in DB. Set as deleted and note time
-                    doc['status'] = {'state': 'deleted', 'detail': int(time.time())}
-                    self.ver("{0} not found, marking as deleted.".format(doc['name']))
+                with Document(self.scandb, document_id=missing_file) as doc:
+                        doc['status'] = {'state': 'deleted', 'detail': int(time.time())}
+                        self.ver("  {0} not found, marking as deleted.".format(doc['name']))
         del self.missing_files[:]
+    
+    # DEPRECATED: Batch-oriented scan model cannot support file movement detection due to duplication problem
+    #def check_missing_broken(self):
+    #    self.ver("  {0} missing files to check...".format(len(self.missing_files)))
+    #    for missing_file in self.missing_files:
+    #        view = self.scandb_views['duplicate_files']
+    #        result = self.scandb.get_view_result(
+    #            view[0],
+    #            view[1],
+    #            reduce=False
+    #        )
+    #        with Document(self.scandb, document_id=missing_file) as doc:
+    #            bound = [
+    #                doc['name'],
+    #                doc['datemodified'],
+    #                doc['checksum'],
+    #                doc['size'],
+    #                doc['host']
+    #                ]
+    #            new_location = result[bound:bound]
+    #            self.ver(new_location)
+    #            if new_location[0]['id'] != None:
+    #                # File has moved.  Set previous doc's status and continue
+    #                doc['status'] = {'state': 'moved', 'detail': new_location[0]['id']}
+    #                self.ver("  {0} moved. New ID: {1}".format(doc['name'],new_location[0]['id']))
+    #            else:
+    #                # File is nowhere else in DB. Set as deleted and note time
+    #                doc['status'] = {'state': 'deleted', 'detail': int(time.time())}
+    #                self.ver("  {0} not found, marking as deleted.".format(doc['name']))
+    #    del self.missing_files[:]
     
     def batch_process(self):
         # If this is the first in the database, don't bother checking anything.
@@ -844,12 +858,12 @@ class FileScan(object):
                 self.file_doc_batch.clear()
         # Update scan document in DB
         self.scandoc.save()
-        self.ver("Batch processed. Continuing scan.")
+        self.ver("  Batch processed. Continuing scan.")
     
     def check_excluded(self, file_path):
         for exclude in self.config['rsync_excluded']: # TO-DO: May have to switch to using a regular expression here
             if exclude in file_path:
-                self.ver("Skipping excluded file {0}".format(file_path))
+                self.ver("  Skipping excluded file {0}".format(file_path))
                 logging.debug("Skipping {0}".format(file_path))
                 return True
             else:
@@ -916,7 +930,7 @@ class FileScan(object):
         for root, dirs, files in os.walk(self.scandoc['directory'], topdown=False):
             for name in files:
                 
-                # Skip excluded files / directories
+                # Skip excluded files / directories - BROKEN
                 if self.check_excluded(os.path.join(root,name)) == True:
                     continue
                 
@@ -927,49 +941,50 @@ class FileScan(object):
                 
                 # Process once we have the threshold number of docs
                 if len(self.file_doc_batch) >= self.config['doc_threshold']:
-                    self.ver("Scanning... Total files so far: {0}".format(self.scandoc['filecount']))
+                    self.ver("  Scanning... Total files so far: {0}".format(self.scandoc['filecount']))
                     self.batch_process()
                     
             # Iterate through directory tree, checking for any missing files
             if (self.scandoc['firstscan'] == False):
-                
-                for directory in dirs:
-                    #ver("Searching {0} for missing files".format(directory))
-                    # Get full list of most recent doc IDs in the directory from DB
-                    view = self.scandb_views['check_for_delete']
-                    result = self.scandb.get_view_result(
-                        view[0],
-                        view[1],
-                        reduce=False
-                    )
-                    
-                    # Get all files marked as "ok" in database for this directory
-                    this_dir_path = os.path.join(root,directory)
-                    this_dir_result = result[[self.config['host_id'],this_dir_path,None]:[self.config['host_id'],this_dir_path,{}]]
-                    #ver("Files expected:")
-                    #ver(this_dir_result)
-                    #ver("Files actual:")
-                
-                    # Get all files currently in the filesystem directory
-                    try:
-                        actual_files = os.listdir(this_dir_path)
-                        #ver(actual_files)
-                    except OSError as e:
-                        self.ver("Couldn't open {0}: {1}".format(this_dir_path, e))
-                    
-                    # check filesystem for any missing files locally.
-                    # Store the IDs of any that aren't there so we can process them after the sweep is finished
-                    for d in this_dir_result:
-                        #self.ver("File: {0} in {1}?".format(d['key'][2], actual_files))
-                        if d['key'][2] not in actual_files:
-                            self.missing_files.append(d['id'])
-                            self.ver("Missing file logged for check: {0}".format(d['id']))
-                    #sys.exit("<END>")
+                self.missing_file_sweep(root, '')
             
         # Process any remaining files in the batch
         if len(self.file_doc_batch) > 0:
-            self.ver("Scanning... Total files so far: {0}".format(self.scandoc['filecount']))
+            self.ver("  Scanning... Total files so far: {0}".format(self.scandoc['filecount']))
             self.batch_process()
+    
+    def missing_file_sweep(self, root, directory):
+        view = self.scandb_views['check_for_delete']
+        result = self.scandb.get_view_result(
+            view[0],
+            view[1],
+            reduce=False
+        )
+            
+        # Get all files marked as "ok" in database for this directory
+        this_dir_path = os.path.join(root,directory)
+        this_dir_result = result[[self.config['host_id'],this_dir_path,None]:[self.config['host_id'],this_dir_path,{}]]
+        #expected_files = []
+        #for expected_file in this_dir_result:
+        #        expected_files.append(expected_file['key'][2])
+        #ver(" Files expected in {0}:".format(this_dir_path))
+        #ver(this_dir_result)
+        #ver(" Files actual:")
+        
+        # Get all files currently in the filesystem directory
+        try:
+            actual_files = os.listdir(this_dir_path)
+            #ver(actual_files)
+        except OSError as e:
+            self.ver("  Couldn't open {0}: {1}".format(this_dir_path, e))
+            
+            
+        # check filesystem for any missing files locally.
+        # Store the IDs of any that aren't there so we can process them after the sweep is finished
+        for d in this_dir_result:
+            if d['key'][2] not in actual_files:
+                self.missing_files.append(d['id'])
+                self.ver("  Missing file logged for check: {0}".format(d['id']))
             
     def get_file_id(self, host_id, full_path, top_dir, timestamp):
         # trim the top_dir from the full path
@@ -1020,7 +1035,7 @@ class FileScan(object):
                 if ddoc.exists() == False:
                     # Create ddoc and view
                     logging.info("Creating {0}/{1}".format(thisview[0],thisview[1]))
-                    self.ver("Creating {0}/{1}".format(thisview[0],thisview[1]))
+                    self.ver("  Creating {0}/{1}".format(thisview[0],thisview[1]))
                     ddoc = DesignDocument(db, document_id=thisview[0])
                     ddoc.add_view(thisview[1], thisview[2], reduce_func = thisview[3])
                     ddoc.save()
@@ -1032,18 +1047,18 @@ class FileScan(object):
                     if oldview == None:
                         # insert it
                         logging.info("Inserting {1} into {0}".format(thisview[0],thisview[1]))
-                        self.ver("Inserting {1} into {0}".format(thisview[0],thisview[1]))
+                        self.ver("  Inserting {1} into {0}".format(thisview[0],thisview[1]))
                         ddoc.add_view(thisview[1],thisview[2],thisview[3])
                         ddoc.save()
                     # if view function is different
                     elif (oldview['map'] != thisview[2]):
                         # Update
                         logging.info("Updating {0}/{1}".format(thisview[0],thisview[1]))
-                        self.ver("Updating {0}/{1}".format(thisview[0],thisview[1]))
+                        self.ver("  Updating {0}/{1}".format(thisview[0],thisview[1]))
                         ddoc.update_view(thisview[1],thisview[2],thisview[3])
                         ddoc.save()
                     else:
-                        self.ver("Skipping {0}/{1}".format(thisview[0],thisview[1]))
+                        self.ver("  Skipping {0}/{1}".format(thisview[0],thisview[1]))
                         continue
         
         db = self.client[dbname]
@@ -1053,18 +1068,18 @@ class FileScan(object):
             versiondoc['current'] = self.config['viewversion']
             versiondoc['history']= []
             versiondoc.save()
-            self.ver("Database is new")
+            self.ver("  Database is new")
             updater()
         else:
             versiondoc.fetch()
         if versiondoc['current'] < self.config['viewversion']:
-            self.ver("Database is older version. Upgrading views.")
+            self.ver("  Database is older version. Upgrading views.")
             updater()
             versiondoc.update_field(action=versiondoc.list_field_append, field='history', value = versiondoc['current'])
             versiondoc.update_field(action=versiondoc.field_set, field='current', value = config['viewversion'])
             versiondoc.save()
         else:
-            self.ver("Database is up-to-date!")
+            self.ver("  Database is up-to-date!")
 
 # Print if verbose
 def ver(string):
@@ -1168,7 +1183,7 @@ def purge_old_dbs(client):
             # If the database is older than one day, and has no documents besides ddocs
             empty_db = client[db]
             if empty_db.doc_count() < (len(scandb_views) + len(search_indexes) + 1):
-                ver("Deleting empty database: " + db)
+                ver(" Deleting empty database: " + db)
                 empty_db.delete()
                 dblist.remove(db)
                 
@@ -1183,13 +1198,12 @@ def purge_old_dbs(client):
             validscans.append(r['value'])
     for db in dblist:
         if ('scandb-' in db) and (db not in validscans) and ((current_time - int(db[7:])) > 7 * day):
-            ver("Deleting {0} due to no successful scans for {1} days.".format(db,7))
+            ver(" Deleting {0} due to no successful scans for {1} days.".format(db,7))
             doomed_db = client[db]
             doomed_db.delete()
     
 # Check database views in database with <dbname> using client <c>, and the set of <views>
 def check_views(dbname, c, views):
-    
     def updater():
         # Open each ddoc / view combo for existing
         for thisview in views.values():
@@ -1197,7 +1211,7 @@ def check_views(dbname, c, views):
             if ddoc.exists() == False:
                 # Create ddoc and view
                 logging.info("Creating {0}/{1}".format(thisview[0],thisview[1]))
-                ver("Creating {0}/{1}".format(thisview[0],thisview[1]))
+                ver(" Creating {0}/{1}".format(thisview[0],thisview[1]))
                 ddoc = DesignDocument(db, document_id=thisview[0])
                 ddoc.add_view(thisview[1], thisview[2], reduce_func = thisview[3])
                 ddoc.save()
@@ -1209,20 +1223,20 @@ def check_views(dbname, c, views):
                 if oldview == None:
                     # insert it
                     logging.info("Inserting {1} into {0}".format(thisview[0],thisview[1]))
-                    ver("Inserting {1} into {0}".format(thisview[0],thisview[1]))
+                    ver(" Inserting {1} into {0}".format(thisview[0],thisview[1]))
                     ddoc.add_view(thisview[1],thisview[2],thisview[3])
                     ddoc.save()
                 # if view function is different
                 elif (oldview['map'] != thisview[2]):
                     # Update
                     logging.info("Updating {0}/{1}".format(thisview[0],thisview[1]))
-                    ver("Updating {0}/{1}".format(thisview[0],thisview[1]))
+                    ver(" Updating {0}/{1}".format(thisview[0],thisview[1]))
                     ddoc.update_view(thisview[1],thisview[2],thisview[3])
                     ddoc.save()
                 else:
-                    ver("Skipping {0}/{1}".format(thisview[0],thisview[1]))
+                    ver(" Skipping {0}/{1}".format(thisview[0],thisview[1]))
                     continue
-    
+
     db = c[dbname]
     versiondoc = Document(db,document_id="scanversion")
     if versiondoc.exists() != True:
@@ -1230,18 +1244,18 @@ def check_views(dbname, c, views):
         versiondoc['current'] = config['viewversion']
         versiondoc['history']= []
         versiondoc.save()
-        ver("Database is new")
+        ver(" Database is new")
         updater()
     else:
         versiondoc.fetch()
     if versiondoc['current'] < config['viewversion']:
-        ver("Database is older version. Upgrading views.")
+        ver(" Database is older version. Upgrading views.")
         updater()
         versiondoc.update_field(action=versiondoc.list_field_append, field='history', value = versiondoc['current'])
         versiondoc.update_field(action=versiondoc.field_set, field='current', value = config['viewversion'])
         versiondoc.save()
     else:
-        ver("Database is up-to-date!")
+        ver(" Database is up-to-date!")
 
 def insert_search_indexes(dbname, client, searchddoc):
     db = client[dbname]
