@@ -1,13 +1,13 @@
-# rsync-checkpoint 0.03
+# rsync-checkpoint 0.04
 When setting up two systems to have a replica filesystem using `rsync`, I often find it hard to get a reliable view of how well-synchronized the two systems are.  
 
 Rsync will happily continue going in whatever operation you set up, but if it's only putting placeholders or skipping over files it can't read, you won't know until you need those copied files or manually go through and check the integrity of them all from time to time.
 
 This is a combination python scanning script, command line tool, and eventually will include a Node.js visualization program to show how closely up-to-date two directories are to one another.  The scanner script runs independently on each host, and uses Cloudant DBaaS  as the means by which each host provide updates about their local filesystem's contents.
 
-The python scripts all utilize the cloudant-python beta (2.0.0b1) library, available from:
+The python scripts all utilize the cloudant-python library, available from:
 
-	pip install --pre cloudant
+	pip install cloudant
 	
 The deprecated (0.5.10) cloudant python library will not work with these scripts.
 
