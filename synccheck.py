@@ -144,32 +144,7 @@ search_indexes = dict(
 
 # Main
 def main():
-    argparser = argparse.ArgumentParser(description = 'Directory "sync" status checking tool for rsync-checkpoint')
-    argparser.add_argument(
-        '-c',
-        metavar='config file',
-        type=file,
-        nargs='?',
-        help='Configuration file to use for sync check. Defaults to trying {0}'.format(config['config_file']),
-        default = config['config_file']
-        )
-    argparser.add_argument(
-        '-r',
-        metavar='minutes',
-        type=int,
-        nargs='?',
-        help='Make script run continusouly, each specified number of minutes',
-        default = 0
-        )
-    argparser.add_argument(
-        '--detail',
-        metavar='flags',
-        type=str,
-        nargs='?',
-        help='Add s for stale files, o for orphaned files, e for files with scan errors, m for missing files. For example, listing all would be [--detail some]'
-    )
-
-    myargs = argparser.parse_args()
+    myargs = get_args()
     load_config(myargs.c)
     interval = myargs.r * 60
     
@@ -195,6 +170,34 @@ def main():
             print_missing(sourcescan,targetscan)
         if 'e' in myargs.detail:
             print_errors(sourcescan,targetscan)
+
+# Process command line args
+def get_args():
+    argparser = argparse.ArgumentParser(description = 'Directory "sync" status checking tool for rsync-checkpoint')
+    argparser.add_argument(
+        '-c',
+        metavar='config file',
+        type=file,
+        nargs='?',
+        help='Configuration file to use for sync check. Defaults to trying {0}'.format(config['config_file']),
+        default = config['config_file']
+        )
+    argparser.add_argument(
+        '-r',
+        metavar='minutes',
+        type=int,
+        nargs='?',
+        help='Make script run continusouly, each specified number of minutes',
+        default = 0
+        )
+    argparser.add_argument(
+        '--detail',
+        metavar='flags',
+        type=str,
+        nargs='?',
+        help='Add s for stale files, o for orphaned files, e for files with scan errors, m for missing files. For example, listing all would be [--detail some]'
+    )
+    return argparser.parse_args()
 
 # Load configuration from file and database into configuration dictionary
 # Gets us: hostIDs, relationshipID, auth, dirs, host names, rsync flags, threshold, maindbname

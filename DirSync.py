@@ -18,6 +18,22 @@ client = None
 main_db = None
 scan_db = None
 
+# dict to hold results of scan sync data
+# Source is always first in each array, target is always second
+results = dict(
+    hostnames = [],
+    ids = [],
+    scandates = [],
+    scancomplete = [],
+    filecount = [],
+    synchronized = 0,
+    dirsize = [],
+    errors = [],
+    missing = 0,
+    orphaned = 0,
+    stale = 0
+)
+
 # Active session user name
 session_user = None
 
@@ -116,6 +132,31 @@ search_indexes = dict(
     ]
 )
 
+# Cloudant authentication information should be here, in order to avoid embedding credentials
+if 'VCAP_SERVICES' in os.environ:
+    vcap = json.loads(os.getenv('VCAP_SERVICES'))
+    print('Found VCAP_SERVICES')
+    if 'cloudantNoSQLDB' in vcap:
+        creds = vcap['cloudantNoSQLDB'][0]['credentials']
+        user = creds['username']
+        password = creds['password']
+        url = 'https://' + creds['host']
+        client = Cloudant(user, password, url=url, connect=True)
+        main_db = client[main_db_name]
+elif os.path.isfile('vcap-local.json'):
+    with open('vcap-local.json') as f:
+        vcap = json.load(f)
+        print('Found local VCAP_SERVICES')
+        creds = vcap['services']['cloudantNoSQLDB'][0]['credentials']
+        user = creds['username']
+        password = creds['password']
+        url = 'https://' + creds['host']
+        client = Cloudant(user, password, url=url, connect=True)
+        main_db = client[main_db_name]
+
+# On Bluemix, get the port number from the environment variable PORT
+# When running this app on the local machine, default the port to 8000
+port = int(os.getenv('PORT', 8000))
 
 # Check login against Cloudant database
 def check_credentials(username,password):
@@ -170,32 +211,6 @@ def get_scan_db():
         return None
     pass
 
-# Cloudant authentication information should be here, in order to avoid embedding credentials
-if 'VCAP_SERVICES' in os.environ:
-    vcap = json.loads(os.getenv('VCAP_SERVICES'))
-    print('Found VCAP_SERVICES')
-    if 'cloudantNoSQLDB' in vcap:
-        creds = vcap['cloudantNoSQLDB'][0]['credentials']
-        user = creds['username']
-        password = creds['password']
-        url = 'https://' + creds['host']
-        client = Cloudant(user, password, url=url, connect=True)
-        main_db = client[main_db_name]
-elif os.path.isfile('vcap-local.json'):
-    with open('vcap-local.json') as f:
-        vcap = json.load(f)
-        print('Found local VCAP_SERVICES')
-        creds = vcap['services']['cloudantNoSQLDB'][0]['credentials']
-        user = creds['username']
-        password = creds['password']
-        url = 'https://' + creds['host']
-        client = Cloudant(user, password, url=url, connect=True)
-        main_db = client[main_db_name]
-
-# On Bluemix, get the port number from the environment variable PORT
-# When running this app on the local machine, default the port to 8000
-port = int(os.getenv('PORT', 8000))
-
 # If session is not logged in, present login screen, otherwise load sync status screen.
 @app.route('/')
 def home():
@@ -225,6 +240,39 @@ def logout():
     session['logged_in'] = False
     return home()
 
+# Obtain the most current scan database(s)
+# MVP: These will almost always be the same.
+def get_scan_db(host):
+    thisview = maindb_views['recent_scans']
+    result = main_db.get_view_result(
+        thisview[0],
+        thisview[1],
+        reduce=False,
+        descending=True,
+        include_docs=True,
+        limit=1
+    )
+    print_local(result)
+    scan_db = result
+
+# Uses scan DB and host ID to obtain most recent scan for host
+# TO-DO: Improve efficiency by reducing DB queries
+def scanning_errors(host_id):
+    scan_id = last_scan(host_id)
+    errors = 0
+    ddoc = scandb_views['problem_files'][0]
+    view = scandb_views['problem_files'][1]
+    result = scan_db.get_view_result(
+        ddoc,
+        view,
+        reduce=True,
+        group_level=1
+        )
+    errors = result[[scan_id,None,None]:[scan_id,{},{}]]['value']
+    return errors
+
+# MVP shows only basic summary stats.  later version will support drill-down into problem files
+
 # /**  TO-DO:
 #  * Endpoint to get JSON of current sync status between the two hosts
 #  * <code>
@@ -232,44 +280,55 @@ def logout():
 #  * </code>
 #  *
 #  * Response:
-#  * {
-#  *  "source": {
-#  *   "hostname": "str",
-#  *   "id":"str",
-#  *   "lastscan": "date/time",
-#  *   "filecount": 0,
-#  *   "totalsize": 0,
-#  *   "errors": 0,
-#  *   "corruptedfiles": 0
-#  *   },
-#  *  "target": {same as above},
-#  *  "stats": {
-#  *   "syncpercent": 00.0,
-#  *   "missingfilecount": 0,
-#  *   "extrafiles": 0  # (Files existing on target but not source)
-#  *   }
-#  *  }
-#  */
+#  * JSON of results{}
 
-@app.route('/api/syncstate', methods=['POST'])
-def get_syncstate():
-    pass
+@app.route('/api/syncstate', methods=['GET'])
+def update_syncstate():
+    
+    # MVP: Obtain data each time.  IN future, make a separate update button to
+    # force an update of this data from Cloudant. Otherwise, use cached results
+    # for display in the app, and only refresh every 60 seconds maximum.
+    
+    # Get recent scan DB(s) # MVP: right now they're the same
+    # sets global 'scan_db' variable
+    get_scan_db()
 
-#@app.route('/api/visitors', methods=['POST'])
-#def put_visitor():
-#    user = request.json['name']
-#    if client:
-#        data = {'name':user}
-#        db.create_document(data)
-#        return 'Hello %s! I added you to the database.' % user
-#    else:
-#        print('No database')
-#        return 'Hello %s!' % user
+    # Get last scan times for each host (and scan IDs?)
+    results['ids'] = get_scan_ids()
+    results['scandates'] = get_scan_times(results['ids'])
+    results['scancomplete'] = are_scans_complete(results['ids'])
+    
+    # Get good files (matching on both hosts)
+    results['synchronized'] = get_files_good()
+    
+    # Get orphaned files
+    results['orphaned'] = get_files_orphaned()
+    
+    # Get files scanned count
+    results['filecount'] = get_files_scanned()
+    
+    # Get scan error counts
+    results['errors'][0] = scanning_errors(source_host) 
+    results['errors'][1] = scanning_errors(target_host)
+    
+    # files existing on source but not destination
+    results['missing'] = get_files_missiong()
+    
+    # "Stale" files? (These might be files existing on target but needing update)
+    results['stale'] = get_files_stale()
+    
+    # Return summary JSON
+    return jsonify(results)
 
 @atexit.register
 def shutdown():
     if client:
         client.disconnect()
+        
+# Enable active "log" when testing on local machine        
+def print_local(output):
+    if port == '8000':
+        print str(output)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port, debug=True)
