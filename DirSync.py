@@ -23,6 +23,7 @@ scan_db = None
 results = dict(
     hostnames = [],
     ids = [],
+    scanids = [],
     scandates = [],
     scancomplete = [],
     filecount = [],
@@ -271,8 +272,33 @@ def scanning_errors(host_id):
     errors = result[[scan_id,None,None]:[scan_id,{},{}]]['value']
     return errors
 
-# MVP shows only basic summary stats.  later version will support drill-down into problem files
+def get_files_scanned(host_id, scan_id): 
+    ddoc = scandb_views['file_types'][0]
+    view = scandb_views['file_types'][1]
+    stats = dict()
+    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
+        result = scan_db.get_view_result(
+            ddoc,
+            view,
+            group_level=2,
+            reduce=True
+        )
+        stats = result[[host_id,scan_id,None]:[host_id,scan_id,{}]]
+    if len(stats) > 0:
+        print_local(stats)
+        return stats
+    else:
+        zeroes = dict(
+            sum = 0,
+            count = 0,
+            min = 0,
+            max = 0,
+            sumsqr = 0
+        )
+        print_local("No files scanned so far!")
+        return zeroes
 
+# MVP shows only basic summary stats.  later version will support drill-down into problem files
 # /**  TO-DO:
 #  * Endpoint to get JSON of current sync status between the two hosts
 #  * <code>
@@ -291,25 +317,26 @@ def update_syncstate():
     
     # Get recent scan DB(s) # MVP: right now they're the same
     # sets global 'scan_db' variable
-    get_scan_db()
+    get_scan_db() # MVP complete
 
     # Get last scan times for each host (and scan IDs?)
-    results['ids'] = get_scan_ids()
+    results['scanids'] = get_scan_ids()
     results['scandates'] = get_scan_times(results['ids'])
     results['scancomplete'] = are_scans_complete(results['ids'])
     
     # Get good files (matching on both hosts)
-    results['synchronized'] = get_files_good()
+    results['synchronized'] = get_files_good() 
     
     # Get orphaned files
     results['orphaned'] = get_files_orphaned()
     
-    # Get files scanned count
-    results['filecount'] = get_files_scanned()
+    # Get files scanned count (returns stats right now)
+    results['filecount'][0] = get_files_scanned(results['ids'][0],results['scanids'][0]) # MVP in-progress
+    results['filecount'][1] = get_files_scanned(results['ids'][1],results['scanids'][1]) # MVP in-progress
     
     # Get scan error counts
-    results['errors'][0] = scanning_errors(source_host) 
-    results['errors'][1] = scanning_errors(target_host)
+    results['errors'][0] = scanning_errors(source_host) # MVP Complete
+    results['errors'][1] = scanning_errors(target_host) # MVP Complete
     
     # files existing on source but not destination
     results['missing'] = get_files_missiong()
