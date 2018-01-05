@@ -254,7 +254,8 @@ def get_scan_db(host):
         limit=1
     )
     print_local(result)
-    scan_db = result
+    scan_db = client[re.sub('scandb-','',result['value'])]
+    results['scanids'] = result['id']
 
 # Uses scan DB and host ID to obtain most recent scan for host
 # TO-DO: Improve efficiency by reducing DB queries
@@ -276,14 +277,15 @@ def get_files_scanned(host_id, scan_id):
     ddoc = scandb_views['file_types'][0]
     view = scandb_views['file_types'][1]
     stats = dict()
-    with cloudant(config['cloudant_user'], config['cloudant_auth'], account=config['cloudant_user']) as client:
-        result = scan_db.get_view_result(
-            ddoc,
-            view,
-            group_level=2,
-            reduce=True
-        )
-        stats = result[[host_id,scan_id,None]:[host_id,scan_id,{}]]
+
+    result = scan_db.get_view_result(
+        ddoc,
+        view,
+        group_level=2,
+        reduce=True
+    )
+    stats = result[[host_id,scan_id,None]:[host_id,scan_id,{}]]
+    
     if len(stats) > 0:
         print_local(stats)
         return stats
@@ -320,7 +322,6 @@ def update_syncstate():
     get_scan_db() # MVP complete
 
     # Get last scan times for each host (and scan IDs?)
-    results['scanids'] = get_scan_ids()
     results['scandates'] = get_scan_times(results['ids'])
     results['scancomplete'] = are_scans_complete(results['ids'])
     
@@ -331,8 +332,8 @@ def update_syncstate():
     results['orphaned'] = get_files_orphaned()
     
     # Get files scanned count (returns stats right now)
-    results['filecount'][0] = get_files_scanned(results['ids'][0],results['scanids'][0]) # MVP in-progress
-    results['filecount'][1] = get_files_scanned(results['ids'][1],results['scanids'][1]) # MVP in-progress
+    results['filecount'][0] = get_files_scanned(results['ids'][0],results['scanids'][0]) # MVP Complete
+    results['filecount'][1] = get_files_scanned(results['ids'][1],results['scanids'][1]) # MVP Complete
     
     # Get scan error counts
     results['errors'][0] = scanning_errors(source_host) # MVP Complete
