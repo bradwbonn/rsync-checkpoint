@@ -2,3 +2,8 @@
 *.txt
 *_temp.py
 /venv*
+/venv/
+/venv
+./venv*
+./venv
+./venv/
