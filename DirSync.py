@@ -1,6 +1,8 @@
 from cloudant import Cloudant
 from cloudant.document import Document
-#import cloudant
+from cloudant.view import View
+from cloudant.design_document import DesignDocument
+
 from flask import Flask, render_template, request, jsonify, session, flash
 from time import sleep
 import atexit
@@ -36,7 +38,7 @@ scan_db = None
 # MVP WORKAROUND: Hosts are HARD-CODED!
 results = dict(
     hostnames = ['Source','Target'],
-    ids = ["6f98988e776b10b84d4b9a37ddc94ea0","c04975184afdc984ad0c41361137bc48"],
+    ids = ["04346641aa1ccdee344f481ae158e595","c04975184afdc984ad0c41361137bc48"],
     scanids = [],
     scandates = [],
     scancomplete = [],
@@ -191,7 +193,7 @@ def check_credentials(username,password):
 # *** MVP WORKAROUND ***
 # hosts for test are currently HARD CODED
 def get_host_IDs():
-    return ["6f98988e776b10b84d4b9a37ddc94ea0","c04975184afdc984ad0c41361137bc48"]
+    return ["04346641aa1ccdee344f481ae158e595","c04975184afdc984ad0c41361137bc48"]
 
 # FUTURE TO-DO: Create admin console for managing users and/or sign-up system
 # Would also automate API key generation for scan clients
@@ -346,20 +348,29 @@ def get_files_stale(target_host_id, scan_id):
     
 # set each host's recent scan ID, time started
 def get_scan_details(hosts):
-    thisview = maindb_views['recent_scans']
+    
+    scandb = None
+    
+    thisddoc = DesignDocument(
+        main_db,
+        maindb_views['recent_scans'][0]
+    )
+    
+    thisview = View(
+        thisddoc,
+        maindb_views['recent_scans'][1]
+    )
+    
     for host in hosts:
-        resultCollection = main_db.get_view_result(
-            thisview[0],
-            thisview[1],
-            reduce=False,
-            descending=True,
-            include_docs=False
-        )
-        result = resultCollection[[host,True,{}]:[host,True,0]]
-        if scan_db == None:
-            scan_db = client[result[0][0]['value']]
-        results['scanids'].append(result[0][0]['id'])
-        results['scandates'].append(result[0][0]['doc']['started'])
+        print_local(host)
+        with thisview.custom_result(descending=True, include_docs=False, reduce=False, limit=1) as rslt:
+            # rslt[[host,True,'Z']: [host,True,0]]
+            for doc in rslt[[host,True,'Z']: [host,True,0]]:
+                print_local(doc)
+                results['scanids'].append(doc['id'])
+                results['scandates'].append(doc['key'][2])
+                scandb = doc['value']
+    return(scandb)
 
 def get_files_orphaned(target_host_id, scan_id):
     ddoc = scandb_views['orphaned_files'][0]
@@ -406,32 +417,33 @@ def update_syncstate():
     # sets global 'scan_db' variable
     # get_scan_db() # Function rolled into scan_details
 
-    # Get last scan times for each host (and scan IDs?)
-    get_scan_details(results['ids'])
+    # Get last scan times for each host (and scan IDs and set scan DB pointer)
+    scan_db_name = get_scan_details(results['ids'])
+    scan_db = client[scan_db_name]
     
     # results['scancomplete'] = are_scans_complete(results['ids']) # Not in MVP
     
     print_local(results)
     
     # Get good files (matching on both hosts)
-    results['synchronized'] = get_files_good(results['ids'][1], results['scanids'][1]) # MVP Complete
+    results['synchronized'] = get_files_good(results['ids'][1], results['scanids'][1], scan_db) # MVP Complete
     
     # Get orphaned files
-    results['orphaned'] = get_files_orphaned(results['ids'][1], results['scanids'][1]) # MVP Complete
+    results['orphaned'] = get_files_orphaned(results['ids'][1], results['scanids'][1], scan_db) # MVP Complete
     
     # Get files scanned count (returns stats right now)
-    results['filecount'][0] = get_files_scanned(results['ids'][0],results['scanids'][0]) # MVP Complete
-    results['filecount'][1] = get_files_scanned(results['ids'][1],results['scanids'][1]) # MVP Complete
+    results['filecount'][0] = get_files_scanned(results['ids'][0],results['scanids'][0], scan_db) # MVP Complete
+    results['filecount'][1] = get_files_scanned(results['ids'][1],results['scanids'][1], scan_db) # MVP Complete
     
     # Get scan error counts
-    results['errors'][0] = scanning_errors(source_host) # MVP Complete
-    results['errors'][1] = scanning_errors(target_host) # MVP Complete
+    results['errors'][0] = scanning_errors(source_host, scan_db) # MVP Complete
+    results['errors'][1] = scanning_errors(target_host, scan_db) # MVP Complete
     
     # files existing on source but not destination
-    results['missing'] = get_files_missing() # How to do: Determine all files with count of 1 for existing between both hosts.
+    results['missing'] = get_files_missing(scan_db) # How to do: Determine all files with count of 1 for existing between both hosts.
     
     # "Stale" files? (These might be files existing on target but needing update)
-    results['stale'] = get_files_stale() # MVP Complete
+    results['stale'] = get_files_stale(scan_db) # MVP Complete
     
     # Return summary JSON
     return jsonify(results)
